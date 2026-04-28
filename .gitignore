@@ -1,0 +1,14 @@
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Symlinked corpus → /home/youssef/redscan/data (37MB of gzipped JSONL).
+# Track the symlink only, not the binary data behind it.
+knowledge/corpus/*.gz
+knowledge/corpus/*.json
+knowledge/corpus/*.jsonl
+knowledge/corpus/README.md

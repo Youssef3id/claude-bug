@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# prowl — file-based bug-hunting workspace.
+# Subcommands:
+#   prowl init <hostname>     start a target: interactive recon intake → brief.md
+#   prowl hunt <hostname>     prepare context bundle for Claude to hunt this target
+#   prowl note <hostname> <text>   append a quick note to memory.md
+#   prowl list                list all targets with status
+#   prowl show <hostname>     print everything Claude needs (brief + memory + findings)
+#   prowl finding <hostname> <slug>  scaffold a new finding file
+#   prowl learn [<slug>|--list]   open/create a knowledge playbook stub
+#   prowl chat                open ~/bughunt in claude --dangerously-skip-permissions
+#   prowl brief <hostname>    open claude in brief-creation mode for <hostname>
+#   prowl ingest <host> <file>...   add captured req/res / notes to targets/<host>/intel/
+#   prowl lookup <query> [-n N] [-t TYPE]  search the redscan corpus (CVEs, writeups, methodology, CWEs)
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+INSTALL_ROOT=$(dirname "$SCRIPT_DIR")
+ROOT="${PROWL_ROOT:-$HOME/bughunt}"
+TARGETS="$ROOT/targets"
+TPL="$INSTALL_ROOT/templates"
+
+die() { echo "prowl: $*" >&2; exit 1; }
+need() { [ -n "${1:-}" ] || die "missing argument: $2"; }
+
+target_dir() {
+  local host="$1"
+  echo "$TARGETS/$host"
+}
+
+cmd_init() {
+  local host="${1:-}"; need "$host" "hostname"
+  local dir; dir=$(target_dir "$host")
+  [ -d "$dir" ] && die "target already exists: $dir"
+  mkdir -p "$dir/findings"
+  cp "$TPL/brief.md" "$dir/brief.md"
+  cp "$TPL/memory.md" "$dir/memory.md"
+  : > "$dir/log.jsonl"
+  : > "$dir/session.txt"
+  sed -i "s|{{HOST}}|$host|g; s|{{DATE}}|$(date -Iseconds)|g" "$dir/brief.md" "$dir/memory.md"
+  echo "Created $dir"
+  echo
+  echo "NEXT — open this brief and fill in the [TODO] sections, then run:"
+  echo "  prowl hunt $host"
+  echo
+  echo "  $dir/brief.md"
+  command -v xdg-open >/dev/null && xdg-open "$dir/brief.md" >/dev/null 2>&1 || true
+}
+
+cmd_hunt() {
+  local host="${1:-}"; need "$host" "hostname"
+  local dir; dir=$(target_dir "$host")
+  [ -d "$dir" ] || die "no such target — run: prowl init $host"
+  # Output a single bundle Claude can read in one shot.
+  echo "# PROWL CONTEXT BUNDLE — $host"
+  echo "# generated: $(date -Iseconds)"
+  echo
+  echo "## brief.md"
+  cat "$dir/brief.md"
+  echo
+  echo "## memory.md (last 80 lines)"
+  tail -n 80 "$dir/memory.md"
+  echo
+  echo "## findings index"
+  ls "$dir/findings" 2>/dev/null | sed 's/^/  - /' || echo "  (none yet)"
+  echo
+  # Intel — operator-supplied captures (req/resp dumps, Burp exports as md, notes).
+  # Inline if small, list-only if large. Always present so Claude reads first.
+  if [ -d "$dir/intel" ] && [ -n "$(ls -A "$dir/intel" 2>/dev/null)" ]; then
+    echo "## intel (operator-supplied captures — READ FIRST before forming hypotheses)"
+    local f sz
+    for f in "$dir/intel"/*; do
+      [ -f "$f" ] || continue
+      sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+      echo
+      echo "### intel/$(basename "$f")  (${sz} bytes)"
+      if [ "$sz" -lt 8192 ]; then
+        cat "$f"
+      else
+        head -80 "$f"
+        echo
+        echo "... [truncated — full file at $dir/intel/$(basename "$f"). cat or Read it for full content.]"
+      fi
+    done
+    echo
+  fi
+  # Score every playbook by keyword overlap with brief.md. Inline the top 4.
+  echo "## matched playbooks (inlined — read these before testing)"
+  local brief_text
+  brief_text=$(tr '[:upper:]' '[:lower:]' < "$dir/brief.md" 2>/dev/null)
+  if [ -n "$brief_text" ]; then
+    declare -A scores 2>/dev/null || true  # bash 4+
+    local pb
+    # Score each playbook by counting matches of its slug-keywords in the brief.
+    for pb in "$ROOT/knowledge/techniques/"*.md; do
+      [ -f "$pb" ] || continue
+      local slug score=0
+      slug=$(basename "$pb" .md)
+      # Slug words (split on '-')
+      local w
+      for w in ${slug//-/ }; do
+        # Skip generic stop-words
+        case "$w" in injection|attacks|based|skills|essential|web|http) continue ;; esac
+        if [ "${#w}" -ge 3 ]; then
+          local n
+          n=$(printf '%s' "$brief_text" | grep -oF -- "$w" | wc -l)
+          score=$(( score + n ))
+        fi
+      done
+      # Boost for exact title-class hits via filename mention in the brief
+      printf '%s' "$brief_text" | grep -qF "$slug" && score=$(( score + 5 ))
+      echo "$score $pb"
+    done | sort -rn | head -4 | while read -r s pb; do
+      [ "$s" -gt 0 ] || continue
+      echo
+      echo "### $(basename "$pb")  (relevance score: $s)"
+      cat "$pb"
+    done
+  fi
+  echo
+  echo "## full playbook catalog (read on demand)"
+  ls "$ROOT/knowledge/techniques/" 2>/dev/null | sed 's|^|  - knowledge/techniques/|'
+  echo
+  echo "## corpus (redscan: 24k CVEs / 23k writeups / 61k methodology / 1.4k CWEs)"
+  echo "Search before forming a hypothesis. Examples:"
+  echo "  prowl lookup \"<product> <bug-class>\"          # all sources"
+  echo "  prowl lookup \"<param-name>\" -t writeup        # only writeups"
+  echo "  prowl lookup \"CVE-2025-\" -t cve -n 20         # CVE catalog"
+  if [ -d "$ROOT/knowledge/corpus" ]; then
+    echo "Corpus location: $ROOT/knowledge/corpus -> $(readlink -f "$ROOT/knowledge/corpus" 2>/dev/null || echo '?')"
+  else
+    echo "Corpus NOT linked. To enable: ln -sfn /home/youssef/redscan/data $ROOT/knowledge/corpus"
+  fi
+}
+
+cmd_note() {
+  local host="${1:-}"; shift || true; need "$host" "hostname"
+  local dir; dir=$(target_dir "$host")
+  [ -d "$dir" ] || die "no such target: $host"
+  printf '\n## %s\n%s\n' "$(date -Iseconds)" "$*" >> "$dir/memory.md"
+  echo "noted."
+}
+
+cmd_list() {
+  [ -d "$TARGETS" ] && [ "$(ls "$TARGETS" 2>/dev/null)" ] || { echo "no targets yet — prowl init <host>"; return; }
+  printf '%-40s %-10s %s\n' "HOST" "FINDINGS" "LAST-NOTE"
+  for d in "$TARGETS"/*/; do
+    local h cnt last
+    h=$(basename "$d")
+    cnt=$(ls "$d/findings" 2>/dev/null | wc -l)
+    last=$(stat -c %y "$d/memory.md" 2>/dev/null | cut -d. -f1)
+    printf '%-40s %-10s %s\n' "$h" "$cnt" "$last"
+  done
+}
+
+cmd_show() {
+  local host="${1:-}"; need "$host" "hostname"
+  local dir; dir=$(target_dir "$host")
+  [ -d "$dir" ] || die "no such target: $host"
+  echo "=== brief ==="; cat "$dir/brief.md"
+  echo; echo "=== memory ==="; cat "$dir/memory.md"
+  echo; echo "=== findings ==="
+  for f in "$dir/findings"/*.md; do
+    [ -e "$f" ] || { echo "(none)"; break; }
+    echo "--- $(basename "$f") ---"
+    cat "$f"; echo
+  done
+}
+
+cmd_chat() {
+  cd "$ROOT" || die "cannot cd to $ROOT"
+  local claude_bin
+  claude_bin=$(command -v claude || echo "$HOME/.local/bin/claude")
+  [ -x "$claude_bin" ] || die "claude binary not found at $claude_bin"
+  echo "→ launching claude in $ROOT (skip-permissions)"
+  exec "$claude_bin" --dangerously-skip-permissions "$@"
+}
+
+cmd_ingest() {
+  local host="${1:-}"; shift || true; need "$host" "hostname"
+  [ "$#" -ge 1 ] || die "no files given. usage: prowl ingest <host> <file>..."
+  local dir; dir=$(target_dir "$host")
+  [ -d "$dir" ] || die "no such target: $host (run: prowl init $host)"
+  mkdir -p "$dir/intel"
+  local count=0 skipped=0 f
+  for f in "$@"; do
+    if [ ! -f "$f" ]; then
+      echo "skip: $f (not a regular file)" >&2
+      skipped=$((skipped+1))
+      continue
+    fi
+    cp -- "$f" "$dir/intel/"
+    count=$((count+1))
+  done
+  echo "Ingested $count file(s) into $dir/intel/"
+  [ "$skipped" -gt 0 ] && echo "Skipped $skipped"
+  echo "Next: bug → hunt $host"
+}
+
+cmd_brief() {
+  local host="${1:-}"; need "$host" "hostname"
+  cd "$ROOT" || die "cannot cd to $ROOT"
+  local claude_bin
+  claude_bin=$(command -v claude || echo "$HOME/.local/bin/claude")
+  [ -x "$claude_bin" ] || die "claude binary not found at $claude_bin"
+  # Init the target dirs first if they don't exist (idempotent).
+  [ -d "$TARGETS/$host" ] || cmd_init "$host" >/dev/null
+  cat <<EOF
+
+→ brief-creation mode for: $host
+  When claude opens, paste the program overview / scope / out-of-scope as one
+  message, prefixed with this exact line so claude routes correctly:
+
+    fill brief for $host from this overview:
+    <paste the entire program text below>
+
+  Claude will overwrite targets/$host/brief.md and STOP. No hunting.
+  When you're ready to hunt later:  bug   →  hunt $host
+
+EOF
+  exec "$claude_bin" --dangerously-skip-permissions
+}
+
+cmd_learn() {
+  local slug="${1:-}"
+  if [ -z "$slug" ] || [ "$slug" = "--list" ]; then
+    grep -E '^\| (✅|🟡|⬜)' "$ROOT/knowledge/portswigger-topics.md" 2>/dev/null \
+      | awk -F'|' '{printf "%-3s %-50s %s\n", $2, $3, $4}'
+    return
+  fi
+  local path="$ROOT/knowledge/techniques/${slug}.md"
+  if [ -e "$path" ]; then
+    echo "$path"
+    command -v xdg-open >/dev/null && xdg-open "$path" >/dev/null 2>&1 || true
+    return
+  fi
+  cat > "$path" <<EOF
+# ${slug}
+
+## when to try
+[TODO fingerprint signals — endpoints, response shapes, headers that suggest this class is in play]
+
+## key bypass tricks
+- [TODO]
+
+## confirmation flow
+1. [TODO baseline]
+2. [TODO probe]
+3. [TODO confirm]
+
+## exploitation snippet
+\`\`\`bash
+[TODO curl / python that demonstrates the bug end-to-end]
+\`\`\`
+
+## caveats
+[TODO false positives, scope/safety, when this class doesn't apply]
+
+## provenance
+[TODO source labs / public reports]
+EOF
+  echo "Stub created: $path"
+  echo "Tell Claude in chat: 'learn ${slug}' to fill it in."
+}
+
+cmd_lookup() {
+  # Keyword search across the redscan corpus (gzipped JSONL).
+  # Default corpus path: $ROOT/knowledge/corpus (symlink to /home/youssef/redscan/data).
+  # Override with PROWL_CORPUS env var.
+  local corpus="${PROWL_CORPUS:-$ROOT/knowledge/corpus}"
+  local n=8 type="" query=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n) n="${2:-8}"; shift 2 ;;
+      -t) type="${2:-}"; shift 2 ;;
+      -*) die "unknown flag: $1" ;;
+      *)  query="${query:+$query }$1"; shift ;;
+    esac
+  done
+  need "$query" "search query"
+  [ -d "$corpus" ] || die "corpus not found at $corpus (set PROWL_CORPUS or symlink /home/youssef/redscan/data)"
+  local files=()
+  if [ -n "$type" ]; then
+    files=("$corpus/${type}.jsonl.gz")
+    [ -f "${files[0]}" ] || die "no such corpus type: $type (try cve|cwe|writeup|methodology|finding|ai_generated)"
+  else
+    files=("$corpus"/cve.jsonl.gz "$corpus"/cwe.jsonl.gz "$corpus"/writeup.jsonl.gz "$corpus"/methodology.jsonl.gz "$corpus"/finding.jsonl.gz)
+  fi
+  local f hits=0 remain
+  for f in "${files[@]}"; do
+    [ -f "$f" ] || continue
+    remain=$(( n - hits ))
+    [ "$remain" -le 0 ] && break
+    local out
+    out=$(zgrep -i -m "$remain" -- "$query" "$f" 2>/dev/null \
+      | python3 "$INSTALL_ROOT/bin/_prowl_format.py" || true)
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+      hits=$(( hits + $(printf '%s' "$out" | grep -c '^---' || true) ))
+    fi
+  done
+  [ "$hits" -gt 0 ] || echo "(no matches for: $query)"
+}
+
+cmd_finding() {
+  local host="${1:-}"; need "$host" "hostname"
+  local slug="${2:-}"; need "$slug" "slug (e.g. sqli-product-stock)"
+  local dir; dir=$(target_dir "$host")
+  [ -d "$dir" ] || die "no such target: $host"
+  local n; n=$(printf '%03d' $(( $(ls "$dir/findings" 2>/dev/null | wc -l) + 1 )))
+  local path="$dir/findings/${n}-${slug}.md"
+  cp "$TPL/finding.md" "$path"
+  sed -i "s|{{SLUG}}|$slug|g; s|{{HOST}}|$host|g; s|{{DATE}}|$(date -Iseconds)|g" "$path"
+  echo "$path"
+}
+
+usage() {
+  sed -n '2,13p' "$0" | sed 's/^# \?//'
+  echo
+  echo "Workspace: $ROOT"
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    init)    cmd_init    "$@" ;;
+    hunt)    cmd_hunt    "$@" ;;
+    note)    cmd_note    "$@" ;;
+    list)    cmd_list    "$@" ;;
+    show)    cmd_show    "$@" ;;
+    finding) cmd_finding "$@" ;;
+    learn)   cmd_learn   "$@" ;;
+    chat)    cmd_chat    "$@" ;;
+    brief)   cmd_brief   "$@" ;;
+    ingest)  cmd_ingest  "$@" ;;
+    lookup)  cmd_lookup  "$@" ;;
+    ""|-h|--help) usage ;;
+    *) die "unknown command: $cmd  (run: prowl --help)" ;;
+  esac
+}
+
+main "$@"
