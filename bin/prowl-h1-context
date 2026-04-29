@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""
+prowl-h1-context <host>
+
+Reads targets/<host>/{brief.md, memory.md, intel/*} and prints the top-N
+H1 disclosed reports most relevant to the target — for auto-injection into
+`prowl hunt` bundles. No user query needed.
+
+Scoring (per indexed report):
+  +3  weakness slug appears in target context
+  +2  per tech token shared with context
+  +2  per parameter name shared with context
+  +1  per host-keyword shared with context (excl. target's own host)
+  *1.5  if bounty > 0 (disclosed-and-paid signal)
+
+Output: short markdown block, one report per row.
+"""
+import json, os, re, sys, pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+IDX  = ROOT / "knowledge/external-reports/h1-shreyas/index.jsonl"
+TGT  = ROOT / "targets"
+TOPN = int(os.environ.get("PROWL_H1_TOPN", "15"))
+
+WEAKNESS_TOKENS = {
+    "ssrf","xxe","sqli","sql injection","xss","csrf","idor","rce",
+    "ssti","lfi","rfi","open redirect","prototype pollution",
+    "deserialization","race condition","dns rebinding","oauth",
+    "saml","jwt","redirect_uri","cache poisoning","smuggling",
+    "graphql","auth bypass","privilege escalation","information disclosure",
+}
+
+PARAM_RE = re.compile(r"[?&]([a-zA-Z_][a-zA-Z0-9_\-]{2,40})=")
+HOST_RE  = re.compile(r"https?://([a-zA-Z0-9.\-]+\.[a-z]{2,})", re.I)
+WORD_RE  = re.compile(r"[a-zA-Z][a-zA-Z0-9_\-\.]{2,}")
+
+def read_target(host):
+    d = TGT / host
+    if not d.exists(): return None
+    parts = []
+    for f in ("brief.md","memory.md"):
+        p = d / f
+        if p.exists(): parts.append(p.read_text(errors="ignore"))
+    intel = d / "intel"
+    if intel.exists():
+        for p in sorted(intel.iterdir()):
+            if p.is_file(): parts.append(p.read_text(errors="ignore"))
+    return "\n".join(parts), d
+
+def signals_from_context(text, host):
+    blob = text.lower()
+    weakness = {w for w in WEAKNESS_TOKENS if w in blob}
+    # tech tokens — match the same vocabulary as the indexer
+    tech_vocab = [
+        "graphql","oauth","openid","saml","jwt","azure b2c","azure ad","aws",
+        "s3","kubernetes","docker","caddy","nginx","cloudflare","django",
+        "flask","rails","laravel","spring","angular","react","vue","wordpress",
+        "okta","auth0","keycloak","stripe","mongodb","postgres","mysql",
+        "ldap","webhook","redirect_uri","sso","mfa","cors","csp","captcha",
+        "hcaptcha","recaptcha","b2c",
+    ]
+    tech = {t for t in tech_vocab if t in blob}
+    params = set(PARAM_RE.findall(text))
+    hosts  = {h.lower() for h in HOST_RE.findall(text)}
+    hosts.discard(host.lower())
+    return weakness, tech, params, hosts
+
+def score(rec, weakness, tech, params, hosts):
+    s = 0
+    rweak = (rec.get("weakness") or "").lower()
+    rtitle = (rec.get("title") or "").lower()
+    sig = rec.get("signals") or {}
+    for w in weakness:
+        if w in rweak or w in rtitle:
+            s += 3
+    rtech = set(sig.get("tech") or [])
+    s += 2 * len(rtech & tech)
+    rparams = set(sig.get("params") or [])
+    s += 2 * len(rparams & params)
+    rhosts = set(sig.get("hosts") or [])
+    s += 1 * len(rhosts & hosts)
+    if (rec.get("bounty") or 0) and float(rec.get("bounty") or 0) > 0:
+        s = int(s * 1.5)
+    return s
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: prowl-h1-context <host>", file=sys.stderr); sys.exit(2)
+    host = sys.argv[1]
+    if not IDX.exists():
+        # silent — no index yet; hunt bundle will simply not get this section
+        return
+    ctx = read_target(host)
+    if ctx is None: return
+    text, _ = ctx
+    weakness, tech, params, hosts = signals_from_context(text, host)
+    if not (weakness or tech or params):
+        return  # nothing to match against
+    scored = []
+    with IDX.open() as f:
+        for line in f:
+            try: rec = json.loads(line)
+            except Exception: continue
+            s = score(rec, weakness, tech, params, hosts)
+            if s > 0:
+                scored.append((s, rec))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if not scored: return
+    print("## relevant disclosed H1 reports (auto)")
+    print(f"_matched on signals: weakness={sorted(weakness) or '-'}, tech={sorted(tech) or '-'}, params={sorted(params)[:6] or '-'}_")
+    print()
+    for s, r in scored[:TOPN]:
+        wk = r.get("weakness") or "?"
+        sev = r.get("severity") or "?"
+        bnt = r.get("bounty")
+        bnt_str = f"${bnt}" if bnt else "-"
+        title = (r.get("title") or "").strip()
+        print(f"- **[{wk} | {sev} | {bnt_str} | score {s}]** {title}")
+        print(f"  {r.get('url')}")
+        ex = (r.get("excerpt") or "").replace("\n"," ")
+        if ex: print(f"  _{ex[:240]}…_")
+
+if __name__ == "__main__":
+    main()

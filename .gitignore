@@ -1,0 +1,23 @@
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Symlinked corpus → /home/youssef/redscan/data (37MB of gzipped JSONL).
+# Track the symlink only, not the binary data behind it.
+knowledge/corpus/*.gz
+knowledge/corpus/*.json
+knowledge/corpus/*.jsonl
+knowledge/corpus/README.md
+
+# Per-target hunt data — private, never commit
+targets/
+
+# Downloaded external corpora (large + may carry target-relevant signals)
+knowledge/external-reports/
+
+# Local-only operator bin
+*.session.txt

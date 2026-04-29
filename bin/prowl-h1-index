@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+Incremental indexer for the H1 disclosed-report corpus.
+
+Reads:  knowledge/external-reports/h1-shreyas/reports/*.json
+Writes: knowledge/external-reports/h1-shreyas/index.jsonl
+
+Each indexed line:
+  {id,title,url,weakness,severity,bounty,disclosed_at,program,
+   signals:{tech:[],params:[],hosts:[]}, excerpt}
+
+Drops reports with empty vulnerability_information (no-content disclosures).
+Resume-safe: skips IDs already present in index.jsonl.
+"""
+import json, os, re, sys, pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+DIR  = ROOT / "knowledge/external-reports/h1-shreyas"
+RPTS = DIR / "reports"
+IDX  = DIR / "index.jsonl"
+
+# Tech tokens worth flagging — lowercase, word-boundary matched.
+TECH = [
+    "graphql","grpc","oauth","openid","saml","jwt","azure b2c","azure ad","aws",
+    "s3","ec2","elasticsearch","kibana","redis","memcached","kafka","rabbitmq",
+    "kubernetes","docker","caddy","nginx","apache","traefik","cloudflare",
+    "django","flask","rails","laravel","spring","express","next.js","nuxt",
+    "angular","react","vue","wordpress","drupal","jenkins","gitlab","jira",
+    "confluence","okta","auth0","keycloak","stripe","twilio","sendgrid",
+    "mongodb","postgres","mysql","sqlite","ldap","smtp","ftp","webdav",
+    "websocket","webhook","redirect_uri","sso","mfa","totp","cors","csp",
+    "ssrf","xxe","prototype pollution","deserialization","race condition",
+    "idor","blind","oob","dns rebinding","cache poisoning","smuggling",
+    "captcha","hcaptcha","recaptcha",
+]
+TECH_RE = [(t, re.compile(r"\b" + re.escape(t) + r"\b", re.I)) for t in TECH]
+
+PARAM_RE = re.compile(r"[?&]([a-zA-Z_][a-zA-Z0-9_\-]{2,40})=")
+HOST_RE  = re.compile(r"https?://([a-zA-Z0-9.\-]+\.[a-z]{2,})", re.I)
+
+def existing_ids():
+    if not IDX.exists(): return set()
+    out = set()
+    with IDX.open() as f:
+        for line in f:
+            try: out.add(str(json.loads(line)["id"]))
+            except Exception: pass
+    return out
+
+def extract(path):
+    try:
+        with path.open() as f: d = json.load(f)
+    except Exception: return None
+    vi = d.get("vulnerability_information") or ""
+    if not vi.strip(): return None  # drop no-content
+    title = d.get("title") or ""
+    blob = (title + "\n" + vi).lower()
+    tech = sorted({t for t,r in TECH_RE if r.search(blob)})
+    params = sorted(set(PARAM_RE.findall(vi)))[:30]
+    hosts  = sorted({h.lower() for h in HOST_RE.findall(vi)})[:30]
+    weak = (d.get("weakness") or {}).get("name") or ""
+    team = (d.get("team") or {}).get("name") or (d.get("team") or {}).get("handle") or ""
+    excerpt = re.sub(r"\s+", " ", vi).strip()[:400]
+    return {
+        "id": d.get("id"),
+        "title": title,
+        "url": d.get("url") or f"https://hackerone.com/reports/{d.get('id')}",
+        "weakness": weak,
+        "severity": d.get("severity_rating") or "",
+        "bounty": d.get("bounty_amount") or 0,
+        "disclosed_at": d.get("disclosed_at"),
+        "program": team,
+        "signals": {"tech": tech, "params": params, "hosts": hosts},
+        "excerpt": excerpt,
+    }
+
+def main():
+    if not RPTS.exists():
+        print(f"no reports dir: {RPTS}", file=sys.stderr); sys.exit(1)
+    have = existing_ids()
+    added = dropped = errs = 0
+    with IDX.open("a") as out:
+        for p in sorted(RPTS.glob("*.json")):
+            rid = p.stem
+            if rid in have: continue
+            rec = extract(p)
+            if rec is None:
+                dropped += 1; continue
+            try:
+                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                added += 1
+            except Exception:
+                errs += 1
+    print(f"indexed: +{added}  dropped(no-content): {dropped}  errs: {errs}  total now: {added + len(have)}")
+
+if __name__ == "__main__":
+    main()
