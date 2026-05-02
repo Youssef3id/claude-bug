@@ -13,11 +13,5 @@ knowledge/corpus/*.json
 knowledge/corpus/*.jsonl
 knowledge/corpus/README.md
 
-# Per-target hunt data — private, never commit
-targets/
-
-# Downloaded external corpora (large + may carry target-relevant signals)
-knowledge/external-reports/
-
 # Local-only operator bin
 *.session.txt

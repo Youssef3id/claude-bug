@@ -1,0 +1,8 @@
+indexed: +6184  dropped(no-content): 1972  errs: 0  total now: 6504
+FETCH-DONE 2026-04-29T13:42:44+03:00
+reports_on_disk=8476
+indexed=6504
+[13:37:57] 9800/10004 ok=8290 skip=5 fail=1505
+[13:39:57] 9900/10004 ok=8380 skip=5 fail=1515
+[13:41:59] 10000/10004 ok=8472 skip=5 fail=1523
+[done 2026-04-29T13:42:04+03:00] total=10004 ok=8476 skip=5 fail=1523
