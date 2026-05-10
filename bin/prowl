@@ -84,38 +84,11 @@ cmd_hunt() {
     done
     echo
   fi
-  # Score every playbook by keyword overlap with brief.md. Inline the top 4.
-  echo "## matched playbooks (inlined — read these before testing)"
-  local brief_text
-  brief_text=$(tr '[:upper:]' '[:lower:]' < "$dir/brief.md" 2>/dev/null)
-  if [ -n "$brief_text" ]; then
-    declare -A scores 2>/dev/null || true  # bash 4+
-    local pb
-    # Score each playbook by counting matches of its slug-keywords in the brief.
-    for pb in "$ROOT/knowledge/techniques/"*.md; do
-      [ -f "$pb" ] || continue
-      local slug score=0
-      slug=$(basename "$pb" .md)
-      # Slug words (split on '-')
-      local w
-      for w in ${slug//-/ }; do
-        # Skip generic stop-words
-        case "$w" in injection|attacks|based|skills|essential|web|http) continue ;; esac
-        if [ "${#w}" -ge 3 ]; then
-          local n
-          n=$(printf '%s' "$brief_text" | grep -oF -- "$w" | wc -l)
-          score=$(( score + n ))
-        fi
-      done
-      # Boost for exact title-class hits via filename mention in the brief
-      printf '%s' "$brief_text" | grep -qF "$slug" && score=$(( score + 5 ))
-      echo "$score $pb"
-    done | sort -rn | head -4 | while read -r s pb; do
-      [ "$s" -gt 0 ] || continue
-      echo
-      echo "### $(basename "$pb")  (relevance score: $s)"
-      cat "$pb"
-    done
+  # Auto-context: score ALL knowledge sources (playbooks, by-stack notes,
+  # redscan corpus) against the target's brief+memory+intel signals and
+  # inline the top picks. Replaces the old bash-only playbook scoring.
+  if [ -x "$ROOT/bin/prowl-auto-context" ]; then
+    "$ROOT/bin/prowl-auto-context" "$host" || true
   fi
   echo
   echo "## full playbook catalog (read on demand)"
@@ -129,7 +102,16 @@ cmd_hunt() {
   if [ -d "$ROOT/knowledge/corpus" ]; then
     echo "Corpus location: $ROOT/knowledge/corpus -> $(readlink -f "$ROOT/knowledge/corpus" 2>/dev/null || echo '?')"
   else
-    echo "Corpus NOT linked. To enable: ln -sfn /home/youssef/redscan/data $ROOT/knowledge/corpus"
+    echo "Corpus NOT linked. To enable: ln -sfn ~/redscan/data $ROOT/knowledge/corpus"
+  fi
+  # Auto-inject H1 disclosed reports relevant to this target (no query needed).
+  # Refresh the index incrementally first so newly downloaded reports get picked up.
+  if [ -x "$ROOT/bin/prowl-h1-index" ] && [ -d "$ROOT/knowledge/external-reports/h1-shreyas/reports" ]; then
+    "$ROOT/bin/prowl-h1-index" >/dev/null 2>&1 || true
+  fi
+  if [ -x "$ROOT/bin/prowl-h1-context" ] && [ -s "$ROOT/knowledge/external-reports/h1-shreyas/index.jsonl" ]; then
+    echo
+    "$ROOT/bin/prowl-h1-context" "$host" || true
   fi
 }
 
@@ -265,7 +247,7 @@ EOF
 
 cmd_lookup() {
   # Keyword search across the redscan corpus (gzipped JSONL).
-  # Default corpus path: $ROOT/knowledge/corpus (symlink to /home/youssef/redscan/data).
+  # Default corpus path: $ROOT/knowledge/corpus (symlink to ~/redscan/data).
   # Override with PROWL_CORPUS env var.
   local corpus="${PROWL_CORPUS:-$ROOT/knowledge/corpus}"
   local n=8 type="" query=""
@@ -278,7 +260,7 @@ cmd_lookup() {
     esac
   done
   need "$query" "search query"
-  [ -d "$corpus" ] || die "corpus not found at $corpus (set PROWL_CORPUS or symlink /home/youssef/redscan/data)"
+  [ -d "$corpus" ] || die "corpus not found at $corpus (set PROWL_CORPUS or symlink ~/redscan/data)"
   local files=()
   if [ -n "$type" ]; then
     files=("$corpus/${type}.jsonl.gz")

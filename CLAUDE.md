@@ -12,7 +12,7 @@ sessions.
 - `knowledge/portswigger-topics.md` — index of 32 vuln-class playbooks.
 - `knowledge/techniques/<slug>.md` — per-class playbooks (read these before testing).
 - `knowledge/by-stack/<stack>.md` — stack-specific gotchas (write new ones as you learn).
-- `knowledge/corpus/` — symlink to `/home/youssef/redscan/data/`: 24k CVEs, 23k bug-bounty/CTF writeups, 61k methodology entries, 1.4k CWEs (gzipped JSONL). Search via `prowl lookup`.
+- `knowledge/corpus/` — symlink to `~/redscan/data/`: 24k CVEs, 23k bug-bounty/CTF writeups, 61k methodology entries, 1.4k CWEs (gzipped JSONL). Search via `prowl lookup`.
 - `targets/<host>/` — one dir per target: `brief.md`, `memory.md`, `findings/NNN-slug.md`, `session.txt`, `log.jsonl`.
 - `CHEAT.md` — operator's command cheat sheet.
 
@@ -121,6 +121,48 @@ hunches in real, disclosed bugs instead of generic playbook theory.
 - `prowl finding <host> <slug>` scaffold a finding file.
 - `prowl learn --list` show playbook coverage.
 - `prowl learn <slug>` open/scaffold a playbook.
+
+## Burp MCP integration
+The workspace has a Burp Suite MCP server wired in (`.mcp.json`). Burp must be
+running with the **MCP Server** extension active (BApp Store → "MCP Server",
+listens on `127.0.0.1:9876`).
+
+### Available Burp MCP tools
+- `get_proxy_http_history` — pull raw HTTP requests/responses from the proxy
+- `send_http1_request` / `send_http2_request` — fire a raw request through Burp
+- `create_repeater_tab` — push a request into Repeater for manual replay
+- `get_burp_collaborator_payload` / `poll_burp_collaborator` — OOB interactions
+- `encode_decode` — encoding utilities
+
+### Auto-brief from Burp history (`burp brief <host>`)
+When the operator says **`burp brief <host>`**:
+1. Call `get_proxy_http_history` filtered to `<host>`.
+2. Extract from the history:
+   - All unique endpoints + HTTP methods observed
+   - Auth mechanism (Cookie names, Authorization header shape, tokens)
+   - Every query/body parameter seen
+   - Interesting response fields (IDs, tokens, hidden fields, debug headers)
+   - Anomalies (200 with error JSON, redirects to internal hosts, etc.)
+3. Overwrite `targets/<host>/brief.md` using `templates/brief.md` — fill EVERY
+   section from observed traffic. Mark anything not seen as `unknown — not observed in capture`.
+4. Append an **intel digest** block to `targets/<host>/memory.md`:
+   ```
+   ## <iso-date> — burp history digest
+   - requests captured: <count>
+   - endpoints: ...
+   - auth: ...
+   - interesting params: ...
+   - hypotheses: ... (3–5, ranked)
+   ```
+5. Report back: endpoints found, auth model inferred, top 3 hypotheses.
+
+### During active hunts
+- Prefer `send_http1_request` over curl when you need responses routed through
+  Burp (so they appear in history and can be replayed).
+- Use `create_repeater_tab` when handing a suspicious request to the operator
+  for manual follow-up.
+- Use `get_burp_collaborator_payload` for any SSRF / XXE / blind injection
+  hypothesis; poll with `poll_burp_collaborator` after a short wait.
 
 ## When in doubt
 - Re-read `CHEAT.md` and the relevant `knowledge/techniques/<slug>.md`.

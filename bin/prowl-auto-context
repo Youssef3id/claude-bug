@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+prowl-auto-context <host>
+
+One-shot auto-context for `prowl hunt`. Reads the target's brief/memory/intel,
+extracts signals, then scores and emits the most relevant items from every
+knowledge source available — without any user query.
+
+Sources:
+  knowledge/techniques/*.md     (PortSwigger-style playbooks)
+  knowledge/by-stack/*.md       (stack-specific notes)
+  knowledge/corpus/*.jsonl.gz   (redscan: cve / writeup / methodology / cwe / finding)
+
+Output is markdown, designed to be appended to the hunt bundle.
+H1 reports are handled by `prowl-h1-context` separately so this tool stays
+useful even before the H1 corpus is fully populated.
+"""
+import json, os, re, sys, gzip, pathlib, collections
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+TGT  = ROOT / "targets"
+TECH_DIR  = ROOT / "knowledge/techniques"
+STACK_DIR = ROOT / "knowledge/by-stack"
+CORPUS    = pathlib.Path(os.environ.get("PROWL_CORPUS", str(ROOT / "knowledge/corpus")))
+
+# Token budgets (inline content shown in bundle)
+TOPN_PLAYBOOKS = int(os.environ.get("PROWL_TOPN_PB", "3"))
+TOPN_STACK     = int(os.environ.get("PROWL_TOPN_STACK", "3"))
+TOPN_CORPUS    = int(os.environ.get("PROWL_TOPN_CORPUS", "8"))
+
+WEAKNESS_TOKENS = [
+    "ssrf","xxe","sql injection","sqli","xss","csrf","idor","rce",
+    "ssti","lfi","rfi","open redirect","prototype pollution",
+    "deserialization","race condition","dns rebinding","oauth",
+    "saml","jwt","redirect_uri","cache poisoning","request smuggling",
+    "graphql","auth bypass","privilege escalation","information disclosure",
+    "clickjacking","cors","csp","subdomain takeover","ldap injection",
+    "command injection","path traversal","directory traversal",
+]
+TECH_VOCAB = [
+    "graphql","grpc","oauth","openid","saml","jwt","azure b2c","azure ad",
+    "aws","s3","ec2","elasticsearch","kibana","redis","memcached","kafka",
+    "kubernetes","docker","caddy","nginx","apache","traefik","cloudflare",
+    "django","flask","rails","laravel","spring","express","next.js","nuxt",
+    "angular","react","vue","wordpress","drupal","jenkins","gitlab","jira",
+    "confluence","okta","auth0","keycloak","strapi","stripe","twilio",
+    "mongodb","postgres","mysql","sqlite","ldap","smtp","webdav","webhook",
+    "websocket","redirect_uri","sso","mfa","totp","cors","csp","captcha",
+    "hcaptcha","recaptcha","b2c","teleport","oidc","jwks","rsa",
+]
+
+PARAM_RE = re.compile(r"[?&]([a-zA-Z_][a-zA-Z0-9_\-]{2,40})=")
+HOST_RE  = re.compile(r"https?://([a-zA-Z0-9.\-]+\.[a-z]{2,})", re.I)
+
+def read_target(host):
+    d = TGT / host
+    if not d.exists(): return None, None
+    parts = []
+    for f in ("brief.md","memory.md"):
+        p = d / f
+        if p.exists(): parts.append(p.read_text(errors="ignore"))
+    intel = d / "intel"
+    if intel.exists():
+        for p in sorted(intel.iterdir()):
+            if p.is_file(): parts.append(p.read_text(errors="ignore"))
+    return "\n".join(parts), d
+
+def signals(text, host):
+    blob = text.lower()
+    weakness = {w for w in WEAKNESS_TOKENS if w in blob}
+    tech     = {t for t in TECH_VOCAB if t in blob}
+    params   = set(PARAM_RE.findall(text))
+    hosts    = {h.lower() for h in HOST_RE.findall(text)}
+    hosts.discard(host.lower())
+    return weakness, tech, params, hosts
+
+def score_doc(text, weakness, tech, params):
+    """Score a markdown doc against target signals."""
+    blob = text.lower()
+    s = 0
+    for w in weakness:
+        s += 4 * blob.count(w)
+    for t in tech:
+        # word-ish boundary
+        s += 3 * len(re.findall(r"\b" + re.escape(t) + r"\b", blob))
+    for p in params:
+        if len(p) >= 4:
+            s += 2 * blob.count(p.lower())
+    return s
+
+def rank_md_dir(d, weakness, tech, params, topn):
+    if not d.exists(): return []
+    out = []
+    for p in sorted(d.glob("*.md")):
+        try: txt = p.read_text(errors="ignore")
+        except Exception: continue
+        s = score_doc(txt, weakness, tech, params)
+        if s > 0: out.append((s, p, txt))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out[:topn]
+
+def corpus_search(weakness, tech, max_per_query=3):
+    """Auto-grep the redscan corpus for the strongest signals.
+
+    Builds queries from the union of (weakness ∪ top tech tokens), runs zgrep
+    via python on .jsonl.gz files, and returns deduplicated short hits.
+    """
+    if not CORPUS.exists(): return []
+    queries = []
+    # Compose meaningful 2-term queries: weakness × tech (top hits first)
+    weak_list = sorted(weakness)[:5]
+    tech_list = sorted(tech)[:6]
+    for w in weak_list:
+        queries.append(w)
+    for t in tech_list:
+        queries.append(t)
+    for w in weak_list:
+        for t in tech_list[:3]:
+            queries.append(f"{w} {t}")
+    seen = set()
+    hits = []
+    files = [CORPUS/"cve.jsonl.gz", CORPUS/"writeup.jsonl.gz",
+             CORPUS/"methodology.jsonl.gz", CORPUS/"finding.jsonl.gz"]
+    for q in queries:
+        if len(hits) >= TOPN_CORPUS: break
+        ql = q.lower()
+        for f in files:
+            if not f.exists(): continue
+            kind = f.stem.replace(".jsonl","")
+            try:
+                with gzip.open(f, "rt", errors="ignore") as fh:
+                    found = 0
+                    for line in fh:
+                        if ql not in line.lower(): continue
+                        try: rec = json.loads(line)
+                        except Exception: continue
+                        # produce a stable key + 1-line summary
+                        rid = rec.get("id") or rec.get("cve_id") or rec.get("url") or rec.get("title","")
+                        if not rid or rid in seen: continue
+                        seen.add(rid)
+                        title = rec.get("title") or rec.get("summary") or rec.get("description") or ""
+                        title = re.sub(r"\s+"," ", str(title)).strip()[:160]
+                        url = rec.get("url") or rec.get("source") or ""
+                        hits.append((kind, q, rid, title, url))
+                        found += 1
+                        if found >= max_per_query: break
+            except Exception: continue
+            if len(hits) >= TOPN_CORPUS: break
+    return hits[:TOPN_CORPUS]
+
+def emit_section(title, body):
+    if not body: return
+    print(f"## {title}")
+    print(body.rstrip())
+    print()
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: prowl-auto-context <host>", file=sys.stderr); sys.exit(2)
+    host = sys.argv[1]
+    text, _ = read_target(host)
+    if text is None: return
+    weakness, tech, params, hosts = signals(text, host)
+    if not (weakness or tech or params): return
+
+    print("## auto-context (knowledge sources scored against this target)")
+    print(f"_signals → weakness: {sorted(weakness) or '-'}_")
+    print(f"_signals → tech:     {sorted(tech) or '-'}_")
+    print(f"_signals → params:   {sorted(params)[:8] or '-'}_")
+    print()
+
+    pbs = rank_md_dir(TECH_DIR, weakness, tech, params, TOPN_PLAYBOOKS)
+    if pbs:
+        print("### top playbooks (inlined)")
+        for s,p,txt in pbs:
+            print(f"\n#### {p.name}  (score {s})")
+            print(txt.rstrip())
+        print()
+
+    stacks = rank_md_dir(STACK_DIR, weakness, tech, params, TOPN_STACK)
+    if stacks:
+        print("### top by-stack notes")
+        for s,p,txt in stacks:
+            # by-stack notes are usually shorter; inline head only
+            head = "\n".join(txt.splitlines()[:60])
+            print(f"\n#### by-stack/{p.name}  (score {s})")
+            print(head.rstrip())
+        print()
+
+    hits = corpus_search(weakness, tech)
+    if hits:
+        print("### corpus auto-hits (redscan: cve/writeup/methodology/finding)")
+        for kind, q, rid, title, url in hits:
+            tail = f" — {url}" if url else ""
+            print(f"- **[{kind}]** ({q!r}) {rid}: {title}{tail}")
+        print()
+
+if __name__ == "__main__":
+    main()

@@ -12,3 +12,6 @@ knowledge/corpus/*.gz
 knowledge/corpus/*.json
 knowledge/corpus/*.jsonl
 knowledge/corpus/README.md
+
+# Local-only operator bin
+*.session.txt
