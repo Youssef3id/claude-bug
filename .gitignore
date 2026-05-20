@@ -15,3 +15,11 @@ knowledge/corpus/README.md
 
 # Local-only operator bin
 *.session.txt
+
+# Target data — stays local, never pushed
+targets/*
+!targets/.gitkeep
+
+# Third-party plugin/vendor source downloaded for research
+um/
+um.zip
