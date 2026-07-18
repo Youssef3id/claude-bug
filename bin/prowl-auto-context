@@ -52,11 +52,45 @@ TECH_VOCAB = [
 PARAM_RE = re.compile(r"[?&]([a-zA-Z_][a-zA-Z0-9_\-]{2,40})=")
 HOST_RE  = re.compile(r"https?://([a-zA-Z0-9.\-]+\.[a-z]{2,})", re.I)
 
+# Tech detected in jsmap/brief → always force-load these playbooks (on top of scored ranking)
+TECH_PLAYBOOK_MAP = {
+    "graphql":    ["graphql.md"],
+    "jwt":        ["jwt.md"],
+    "oauth":      ["oauth.md"],
+    "saml":       ["oauth.md"],
+    "oidc":       ["oauth.md", "jwt.md"],
+    "react":      ["dom-based.md", "prototype-pollution.md"],
+    "angular":    ["dom-based.md"],
+    "vue":        ["dom-based.md"],
+    "next.js":    ["dom-based.md", "ssrf.md"],
+    "nuxt":       ["dom-based.md"],
+    "websocket":  ["request-smuggling.md"],
+    "grpc":       ["api-testing.md"],
+    "cors":       ["cors.md"],
+    "ssti":       ["ssti.md"],
+    "rails":      ["ssti.md", "deserialization.md"],
+    "django":     ["ssti.md"],
+    "laravel":    ["ssti.md"],
+    "spring":     ["deserialization.md", "ssrf.md"],
+    "okta":       ["oauth.md", "jwt.md", "mfa-bypass.md"],
+    "auth0":      ["oauth.md", "jwt.md"],
+    "stripe":     ["business-logic.md"],
+    "aws":        ["ssrf.md"],
+    "s3":         ["ssrf.md"],
+    "graphql":    ["graphql.md"],
+    "websocket":  ["request-smuggling.md"],
+    "mfa":        ["mfa-bypass.md"],
+    "totp":       ["mfa-bypass.md"],
+    "ssrf":       ["ssrf.md"],
+    "iframe":     ["iframe-postmessage.md", "clickjacking.md"],
+    "postmessage":["iframe-postmessage.md"],
+}
+
 def read_target(host):
     d = TGT / host
     if not d.exists(): return None, None
     parts = []
-    for f in ("brief.md","memory.md"):
+    for f in ("brief.md", "memory.md", "jsmap.md"):
         p = d / f
         if p.exists(): parts.append(p.read_text(errors="ignore"))
     intel = d / "intel"
@@ -169,9 +203,32 @@ def main():
     print(f"_signals → params:   {sorted(params)[:8] or '-'}_")
     print()
 
+    # Force-load playbooks for detected tech (guaranteed, not just scored)
+    forced_names = set()
+    for t in tech:
+        for pb in TECH_PLAYBOOK_MAP.get(t, []):
+            forced_names.add(pb)
+    forced_pbs = []
+    for name in sorted(forced_names):
+        p = TECH_DIR / name
+        if p.exists():
+            try:
+                forced_pbs.append((name, p.read_text(errors="ignore")))
+            except Exception:
+                pass
+
+    if forced_pbs:
+        print("### tech-matched playbooks (forced by detected stack)")
+        for name, txt in forced_pbs:
+            print(f"\n#### {name}")
+            print(txt.rstrip())
+        print()
+
     pbs = rank_md_dir(TECH_DIR, weakness, tech, params, TOPN_PLAYBOOKS)
+    # Filter out already-forced ones to avoid duplication
+    pbs = [(s,p,txt) for s,p,txt in pbs if p.name not in forced_names]
     if pbs:
-        print("### top playbooks (inlined)")
+        print("### top scored playbooks")
         for s,p,txt in pbs:
             print(f"\n#### {p.name}  (score {s})")
             print(txt.rstrip())
@@ -181,10 +238,8 @@ def main():
     if stacks:
         print("### top by-stack notes")
         for s,p,txt in stacks:
-            # by-stack notes are usually shorter; inline head only
-            head = "\n".join(txt.splitlines()[:60])
             print(f"\n#### by-stack/{p.name}  (score {s})")
-            print(head.rstrip())
+            print(txt.rstrip())
         print()
 
     hits = corpus_search(weakness, tech)
@@ -194,6 +249,19 @@ def main():
             tail = f" — {url}" if url else ""
             print(f"- **[{kind}]** ({q!r}) {rid}: {title}{tail}")
         print()
+
+    # Suggested live searches for Claude to run at hunt start
+    print("### suggested report searches (run these before forming a hypothesis)")
+    weak_top = sorted(weakness)[:3]
+    tech_top  = sorted(tech)[:3]
+    host_clean = host.replace("-","").replace(".","")
+    for w in weak_top:
+        print(f'- `prowl lookup "{host} {w}" -t writeup -n 5`')
+    for t in tech_top:
+        print(f'- `prowl lookup "{t} {weak_top[0] if weak_top else "auth bypass"}" -t writeup -n 5`')
+    print(f'- web search: `"{host}" bug bounty disclosed 2024 2025`')
+    print(f'- web search: `site:hackerone.com/reports "{host.split(".")[0]}"` (if H1 program)')
+    print()
 
 if __name__ == "__main__":
     main()

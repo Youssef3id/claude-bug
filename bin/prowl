@@ -3,6 +3,9 @@
 # Subcommands:
 #   prowl init <hostname>     start a target: interactive recon intake → brief.md
 #   prowl hunt <hostname>     prepare context bundle for Claude to hunt this target
+#   prowl jsmap <hostname> [--js-dir <path>]  analyze JS files → surface map + deduped URL list
+#   prowl cohunt <hostname>   autonomous AI co-hunt: pairs with your manual Burp testing,
+#                             reads full req/resp + leads from BurpStrike, hunts all classes
 #   prowl note <hostname> <text>   append a quick note to memory.md
 #   prowl list                list all targets with status
 #   prowl show <hostname>     print everything Claude needs (brief + memory + findings)
@@ -12,6 +15,17 @@
 #   prowl brief <hostname>    open claude in brief-creation mode for <hostname>
 #   prowl ingest <host> <file>...   add captured req/res / notes to targets/<host>/intel/
 #   prowl lookup <query> [-n N] [-t TYPE]  search the redscan corpus (CVEs, writeups, methodology, CWEs)
+#   prowl audit <zip|dir|url> [--name S] [--version V]  scan a WP plugin's attack surface + scaffold an audit target
+#   prowl wphunt               open claude (sonnet) in WP-plugin-audit mode — paste the plugin link to start
+#   prowl wphunt --auto        autonomous mode — claude picks the plugin itself and starts immediately
+#   prowl wphunt --auto --sqli hunt only SQL injection  (combine with --auto or use alone after pasting plugin)
+#   prowl wphunt --auto --lfi  hunt only Local File Inclusion
+#   prowl wphunt --auto --rce  hunt only Remote Code Execution
+#   prowl wphunt --auto --fileupload  hunt only arbitrary file upload
+#   prowl wphunt --auto --xss  hunt only Stored XSS (Subscriber-level)
+#   prowl wphunt --auto --privesc  hunt only privilege escalation to admin
+#   prowl wphunt --auto --deserialize  hunt only PHP object injection / deserialization
+#   (flags can be combined, e.g. --auto --sqli --rce)
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
@@ -84,6 +98,14 @@ cmd_hunt() {
     done
     echo
   fi
+  # JS surface map — auto-include if jsmap.md exists for this target.
+  # Run `prowl jsmap <host>` first to generate it.
+  if [ -f "$dir/jsmap.md" ]; then
+    echo
+    echo "## JS surface map (jsmap.md — run 'prowl jsmap $host' to refresh)"
+    cat "$dir/jsmap.md"
+    echo
+  fi
   # Auto-context: score ALL knowledge sources (playbooks, by-stack notes,
   # redscan corpus) against the target's brief+memory+intel signals and
   # inline the top picks. Replaces the old bash-only playbook scoring.
@@ -113,6 +135,13 @@ cmd_hunt() {
     echo
     "$ROOT/bin/prowl-h1-context" "$host" || true
   fi
+  # BurpStrike active scanner: boot it, scope it to this host, and inline a live
+  # findings section so the hunt uses it. Disable with PROWL_BURPSTRIKE=0.
+  if [ "${PROWL_BURPSTRIKE:-1}" != "0" ] && [ -x "$ROOT/bin/prowl-burpstrike" ]; then
+    echo
+    "$ROOT/bin/prowl-burpstrike" start >/dev/null 2>&1 || true
+    "$ROOT/bin/prowl-burpstrike" bundle "$host" || true
+  fi
 }
 
 cmd_note() {
@@ -133,6 +162,25 @@ cmd_list() {
     last=$(stat -c %y "$d/memory.md" 2>/dev/null | cut -d. -f1)
     printf '%-40s %-10s %s\n' "$h" "$cnt" "$last"
   done
+}
+
+cmd_jsmap() {
+  local host="${1:-}"; need "$host" "hostname"
+  shift || true
+  local js_dir_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --js-dir) js_dir_arg="--js-dir ${2:-}"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  local dir; dir=$(target_dir "$host")
+  [ -d "$dir" ] || die "no such target: $host (run: prowl init $host)"
+  local jsmap_py="$INSTALL_ROOT/bin/prowl-jsmap"
+  [ -f "$jsmap_py" ] || die "prowl-jsmap not found at $jsmap_py"
+  # Make sure jsluice is on PATH
+  export PATH="$HOME/go/bin:$PATH"
+  python3 "$jsmap_py" "$host" $js_dir_arg
 }
 
 cmd_show() {
@@ -296,8 +344,257 @@ cmd_finding() {
   echo "$path"
 }
 
+cmd_audit() {
+  local input="${1:-}"; need "$input" "plugin zip | dir | url"
+  shift || true
+  local slug="" version=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name|--slug) slug="${2:-}"; shift 2 ;;
+      --version)     version="${2:-}"; shift 2 ;;
+      -*) die "unknown flag: $1" ;;
+      *)  die "unexpected argument: $1" ;;
+    esac
+  done
+
+  command -v unzip >/dev/null || die "unzip not found (sudo apt-get install unzip)"
+  local tmp; tmp=$(mktemp -d); trap '[ -n "${tmp:-}" ] && rm -rf "$tmp"' EXIT
+  local srcroot=""
+
+  if [[ "$input" =~ ^https?:// ]]; then
+    local zipurl="" wpslug=""
+    if [[ "$input" =~ \.zip(\?.*)?$ ]]; then
+      zipurl="$input"
+      if [ -z "$slug" ]; then wpslug=$(basename "${input%%\?*}" .zip); slug="${wpslug%%.[0-9]*}"; fi
+    elif [[ "$input" =~ wordpress\.org/plugins/([^/?#]+) ]]; then
+      wpslug="${BASH_REMATCH[1]}"; [ -z "$slug" ] && slug="$wpslug"
+      if [ -n "$version" ]; then zipurl="https://downloads.wordpress.org/plugin/${wpslug}.${version}.zip"
+      else zipurl="https://downloads.wordpress.org/plugin/${wpslug}.zip"; fi
+    else
+      die "unsupported URL — give a *.zip link or https://wordpress.org/plugins/<slug>/"
+    fi
+    echo "→ downloading $zipurl"
+    curl -fsSL --retry 2 -A "Mozilla/5.0 prowl-audit" "$zipurl" -o "$tmp/plugin.zip" \
+      || die "download failed: $zipurl"
+    unzip -q "$tmp/plugin.zip" -d "$tmp/src" || die "unzip failed"
+    srcroot="$tmp/src"
+  elif [ -f "$input" ]; then
+    case "$input" in
+      *.zip) unzip -q "$input" -d "$tmp/src" || die "unzip failed"; srcroot="$tmp/src"
+             [ -z "$slug" ] && slug=$(basename "$input" .zip) ;;
+      *) die "file is not a .zip: $input" ;;
+    esac
+  elif [ -d "$input" ]; then
+    srcroot="$input"; [ -z "$slug" ] && slug=$(basename "$input")
+  else
+    die "no such input: $input"
+  fi
+
+  # Descend into a single top-level dir (the usual zip layout: plugin-slug/...).
+  local entries; mapfile -t entries < <(find "$srcroot" -maxdepth 1 -mindepth 1)
+  if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+    srcroot="${entries[0]}"; [ -z "$slug" ] && slug=$(basename "$srcroot")
+  fi
+
+  slug=$(printf '%s' "$slug" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9._-]/-/g; s/^-*//; s/-*$//')
+  [ -n "$slug" ] || die "could not derive a slug — pass --name <slug>"
+  local dir="$TARGETS/$slug"
+  mkdir -p "$dir/findings" "$dir/audit"
+
+  # Refresh the source tree + scanner output (idempotent; re-runnable per version).
+  rm -rf "$dir/src"; cp -a "$srcroot" "$dir/src"
+  echo "→ scanning attack surface…"
+  local summary
+  summary=$(python3 "$INSTALL_ROOT/bin/_prowl_audit.py" --src "$dir/src" --out "$dir/audit" --slug "$slug") \
+    || die "scanner failed"
+
+  # Pull meta out of the scanner summary line for brief/seed.
+  local meta_get; meta_get() { printf '%s' "$summary" | python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))"; }
+  local pname pver
+  pname=$(meta_get name); pver=$(meta_get version)
+
+  # Seed brief.md once (don't clobber operator edits on re-audit).
+  if [ ! -f "$dir/brief.md" ]; then
+    local cve_hits="(corpus not configured)"
+    if [ -d "$ROOT/knowledge/corpus" ] && [ -n "$pname" ]; then
+      cve_hits=$(PROWL_ROOT="$ROOT" "$0" lookup "$pname $pver" -n 5 2>/dev/null || true)
+      [ -n "$cve_hits" ] || cve_hits="(no corpus matches for: $pname $pver)"
+    fi
+    {
+      echo "# $slug — WP plugin audit brief"
+      echo "created: $(date -Iseconds)"
+      echo "source: $input"
+      echo
+      echo "## plugin"
+      echo "- name: ${pname:-?}"
+      echo "- version: ${pver:-?}"
+      echo "- requires PHP: $(meta_get requires_php)  |  requires WP: $(meta_get requires_wp)"
+      echo "- main file: \`$(meta_get main_file)\`"
+      echo
+      echo "## attack surface (scanner — see audit/surface-map.md)"
+      echo "- php files in scope: $(meta_get php_in_scope)"
+      echo "- interesting files: $(meta_get interesting)"
+      echo "- unauthenticated entry points: $(meta_get nopriv_entries)"
+      echo "- fan-out clusters: $(meta_get clusters)"
+      echo
+      echo "## prior disclosed (redscan corpus)"
+      echo '```'
+      printf '%s\n' "$cve_hits"
+      echo '```'
+      echo
+      echo "## audit goals (priority)"
+      echo "1. Unauthenticated entry points (wp_ajax_nopriv / open REST) → SQLi / file ops / RCE"
+      echo "2. Subscriber/Customer-reachable state-changing actions → privesc / deserialization"
+      echo "3. Tainted source → dangerous sink with no sanitiser (\$wpdb, include, unserialize, file ops)"
+      echo "   (admin-only surface is OUT of scope — see knowledge/patchstack-rules.md)"
+      echo
+      echo "## Patchstack scope gates (knowledge/patchstack-rules.md)"
+      echo "- role: unauth (x2) or Subscriber/Customer (x1); Contributor only if CVSS ≥7.5; Admin+ = OUT."
+      echo "- class must be on the accepted list (open redirect / HTML-only / contributor+ XSS = OUT)."
+      echo "- CVSS ≥6.5 (≥8.5 for low-install); AC:H rejected; must be novel (not already in Patchstack DB)."
+      echo
+      echo "## rules (from CLAUDE.md + memory)"
+      echo "- everything here is a CANDIDATE. A working LOCAL PoC is still a candidate,"
+      echo "  not a confirmed bug — only the operator promotes it. Report evidence factually."
+      echo "  (Rejection ≥67% → zero payout + XP reset — accuracy is non-negotiable.)"
+      echo "- ≥5 payloads per input/function; 404 ≠ PoC. Frame by the exploitable PRIMITIVE."
+    } > "$dir/brief.md"
+  fi
+  [ -f "$dir/memory.md" ] || { cp "$TPL/memory.md" "$dir/memory.md"
+    sed -i "s|{{HOST}}|$slug|g; s|{{DATE}}|$(date -Iseconds)|g" "$dir/memory.md"; }
+  [ -f "$dir/log.jsonl" ] || : > "$dir/log.jsonl"
+
+  echo
+  echo "✓ audit target ready: $dir"
+  echo "  brief:        $dir/brief.md"
+  echo "  surface map:  $dir/audit/surface-map.md"
+  echo "  manifest:     $dir/audit/manifest.json"
+  echo "  source tree:  $dir/src/"
+  echo
+  echo "NEXT (deep audit): read audit/surface-map.md, fan out one subagent per cluster"
+  echo "following prompts/code-audit.md, then aggregate leads into audit/leads.jsonl."
+}
+
+cmd_cohunt() {
+  # Autonomous co-hunt: AI pairs with your manual Burp testing, reads everything
+  # from the BurpStrike tool (not Burp), and hunts ALL bug classes.
+  local host="${1:-}"; need "$host" "hostname"
+  cd "$ROOT" || die "cannot cd to $ROOT"
+  local claude_bin
+  claude_bin=$(command -v claude || echo "$HOME/.local/bin/claude")
+  [ -x "$claude_bin" ] || die "claude binary not found at $claude_bin"
+  [ -d "$TARGETS/$host" ] || cmd_init "$host" >/dev/null
+
+  # Boot BurpStrike (active + scoped to this host) so capture/analysis is live.
+  if [ -x "$ROOT/bin/prowl-burpstrike" ]; then
+    "$ROOT/bin/prowl-burpstrike" start >/dev/null 2>&1 || true
+    "$ROOT/bin/prowl-burpstrike" scope "$host" >/dev/null 2>&1 || true
+  fi
+
+  cat <<EOF
+
+→ CO-HUNT mode for: $host   (autonomous; the AI reads everything from BurpStrike)
+  You drive Burp manually (browse + Repeater). Every request flows into the tool;
+  the AI watches the tool's full req/resp capture + leads and hunts WITH you.
+  Backend: http://127.0.0.1:7332   Dashboard: open it to watch.
+
+EOF
+  exec "$claude_bin" --dangerously-skip-permissions \
+    "cohunt mode for ${host}. You are the autonomous co-hunter. Do this now, no questions:
+1. Read prompts/cohunt.md (your protocol) and targets/${host}/brief.md (scope/accounts/docs);
+   read targets/${host}/intel/* and any docs present.
+2. Confirm BurpStrike is up: curl -s http://127.0.0.1:7332/stats. If down, run bin/prowl-burpstrike start.
+3. Begin the co-hunt loop: poll http://127.0.0.1:7332/feed, map the surface, reason across ALL
+   bug classes (access-control, injection, SSRF, business-logic, plus confirm BurpStrike's
+   XSS/redirect/traversal/CORS candidates), test against operator-controlled accounts only,
+   confirm impact with a real PoC, and write findings.
+Scope-first, never destructive against others, everything is a CANDIDATE. Loop continuously as
+I generate traffic in Burp; re-poll /feed with the last timestamp each cycle."
+}
+
+cmd_wphunt() {
+  cd "$ROOT" || die "cannot cd to $ROOT"
+  local claude_bin
+  claude_bin=$(command -v claude || echo "$HOME/.local/bin/claude")
+  [ -x "$claude_bin" ] || die "claude binary not found at $claude_bin"
+  local model="${PROWL_AUDIT_MODEL:-sonnet}"
+
+  # Parse flags
+  local auto=0 classes=()
+  for arg in "$@"; do
+    case "$arg" in
+      --auto)        auto=1 ;;
+      --sqli)        classes+=("SQL Injection") ;;
+      --lfi)         classes+=("Local File Inclusion") ;;
+      --rce)         classes+=("Remote Code Execution") ;;
+      --fileupload)  classes+=("Arbitrary File Upload") ;;
+      --filedelete)  classes+=("Arbitrary File Deletion") ;;
+      --fileread)    classes+=("Arbitrary File Read / Download") ;;
+      --xss)         classes+=("Stored XSS (Subscriber-level or lower)") ;;
+      --privesc)     classes+=("Privilege Escalation to Admin") ;;
+      --deserialize) classes+=("PHP Object Injection / Insecure Deserialization") ;;
+      --csrf)        classes+=("CSRF leading to file upload/delete/RCE/privesc") ;;
+      --ssrf)        classes+=("SSRF with demonstrated impact") ;;
+      --*) die "unknown flag: $arg  (see prowl --help)" ;;
+    esac
+  done
+
+  # Build the class-restriction instruction for Claude
+  local class_instruction=""
+  if [ "${#classes[@]}" -gt 0 ]; then
+    local class_list; class_list=$(printf '  • %s\n' "${classes[@]}")
+    class_instruction="
+HUNT SCOPE — CLASS RESTRICTION (operator-set, non-negotiable):
+Only report candidates for these vulnerability classes:
+${class_list}
+Ignore ALL other bug classes entirely — do not mention them, do not score them, do not include them in leads.jsonl.
+If a file has no sink for the restricted class(es), skip it and move on.
+Apply this filter at every stage: surface-map triage, subagent briefing, lead aggregation, final report."
+  fi
+
+  # Build label for terminal output
+  local class_label="all classes"
+  [ "${#classes[@]}" -gt 0 ] && class_label=$(printf '%s' "${classes[*]}" | sed 's/ /+/g')
+
+  if [ "$auto" -eq 1 ]; then
+    cat <<EOF
+
+→ WP plugin audit mode — AUTO (model: $model) | scope: $class_label
+  Claude will pick a target from WordPress.org and start immediately.
+  No input needed from you.
+
+EOF
+    exec "$claude_bin" --dangerously-skip-permissions --model "$model" \
+      "wphunt --auto: You are in autonomous WP plugin audit mode. Do NOT wait for operator input.
+${class_instruction}
+Follow the 'wphunt --auto' selection algorithm in CLAUDE.md RIGHT NOW:
+1. Query the WP.org API for high-risk-tag plugins (booking/form/upload/membership/ajax/api) with >=10k installs updated within 12 months.
+2. Run Gate 5 check on each candidate (curl WP.org API — skip closed/stale/already in targets/).
+3. Run prowl lookup novelty pre-screen on the top 3.
+4. Pick the winner, announce it in one line: '→ auto-selected: <slug> v<version> (<installs> installs, last updated <date>)'
+5. Immediately run prowl audit https://wordpress.org/plugins/<slug>/ and begin the full deep-audit fan-out per CLAUDE.md — no waiting, no questions.
+Reminder: everything is a CANDIDATE. Never call anything a confirmed bug. False positives cost real money."
+
+  else
+    cat <<EOF
+
+→ WP plugin audit mode (model: $model) | scope: $class_label
+  Just paste ONE of these as your next message — the audit starts immediately:
+    • wordpress.org URL     https://wordpress.org/plugins/<slug>/
+    • direct .zip URL       https://downloads.wordpress.org/plugin/<slug>.zip
+    • local plugin zip      ~/bughunt/<slug>.zip
+    • plugin directory      ~/bughunt/<slug>/
+
+EOF
+    exec "$claude_bin" --dangerously-skip-permissions --model "$model" \
+      "wphunt: WordPress plugin source-code audit mode.
+${class_instruction}
+Acknowledge in ONE line (including the active class scope if restricted) and wait for me to paste a plugin link (or zip path / directory). The moment I do, run \`prowl audit <input>\` and begin the deep-audit fan-out per CLAUDE.md (WP plugin audit route) — no recon-intake questions. Reminder: results are CANDIDATES; never call anything a confirmed bug, even after a local PoC."
+  fi
+}
+
 usage() {
-  sed -n '2,13p' "$0" | sed 's/^# \?//'
+  sed -n '2,16p' "$0" | sed 's/^# \?//'
   echo
   echo "Workspace: $ROOT"
 }
@@ -307,6 +604,7 @@ main() {
   case "$cmd" in
     init)    cmd_init    "$@" ;;
     hunt)    cmd_hunt    "$@" ;;
+    cohunt)  cmd_cohunt  "$@" ;;
     note)    cmd_note    "$@" ;;
     list)    cmd_list    "$@" ;;
     show)    cmd_show    "$@" ;;
@@ -316,6 +614,9 @@ main() {
     brief)   cmd_brief   "$@" ;;
     ingest)  cmd_ingest  "$@" ;;
     lookup)  cmd_lookup  "$@" ;;
+    jsmap)   cmd_jsmap   "$@" ;;
+    audit)        cmd_audit  "$@" ;;
+    wphunt|wpbug) cmd_wphunt "$@" ;;
     ""|-h|--help) usage ;;
     *) die "unknown command: $cmd  (run: prowl --help)" ;;
   esac

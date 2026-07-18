@@ -73,16 +73,143 @@ Auto-route based on the URL host:
    - Report back: vuln class, technique used, payload, evidence the lab is `is-solved`.
    - DO NOT start a long recon process for a lab — labs are scoped to one bug; jump straight to the playbook.
 
-2. **Any other URL** (real bounty target):
+2. **A WordPress plugin** (a local `*.zip`, a plugin directory, a
+   `https://wordpress.org/plugins/<slug>/` page, or a `downloads.wordpress.org/...zip`
+   link) — route to **WP plugin audit mode** below, NOT recon-intake.
+
+3. **Any other URL** (real bounty target):
    - Treat as `new target: <host> — recon-intake`.
    - Follow `prompts/recon-intake.md`: ask the user 5 short questions (program URL, scope/OOS, accounts, prior intel) BEFORE doing anything active.
    - Then light passive recon (≤10 zero-impact requests), write `targets/<host>/brief.md`, propose 2–3 goals.
    - Stop and wait for the operator to say "hunt" before active testing.
 
+### WP plugin source-code audit (`wphunt`)
+The operator launches `wphunt` (= `prowl wphunt`, opens claude on **sonnet**) and
+pastes a plugin as the next message. Trigger this route whenever the message is —
+with or without an `audit:`/`wphunt`/`wpbug` prefix — a local plugin zip path, a
+plugin directory, a `wordpress.org/plugins/<slug>` URL, or a direct `.zip` URL.
+
+**This whole route must run on Sonnet.** Keep every step concrete and mechanical;
+do not rely on Opus-only leaps. The instructions here + `prompts/code-audit.md`
+are the full spec — follow them literally.
+
+Steps (start IMMEDIATELY — no recon-intake, no 5 questions):
+
+**STEP 0 — Gate 5 check BEFORE touching any code (do this first, takes 30 seconds):**
+Run these two checks and STOP if either fails:
+```
+# Is the plugin still live and maintained?
+curl -s "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request[slug]=<slug>&request[fields][active_installs]=1&request[fields][last_updated]=1" | python3 -c "import sys,json; d=json.load(sys.stdin); print('installs:', d.get('active_installs',0), '| last_updated:', d.get('last_updated','?'), '| status:', d.get('error','live'))"
+```
+- If the API returns `{"error":"closed"}` or similar → **plugin is closed/removed → ABORT, tell the operator, pick a new target.**
+- If `last_updated` is more than 3 years ago → **ABORT, out of scope per Gate 5.**
+- Note the `active_installs` count — if < 100, CVSS floor becomes 8.5 (Gate 2).
+- For non-wordpress.org sources (CodeCanyon, GitHub, vendor site) verify the plugin is still actively sold/maintained before proceeding.
+
+**Only proceed to step 1 after Gate 5 passes.**
+
+1. Run `prowl audit <input>` (it resolves zip/dir/URL, copies the source to
+   `targets/<slug>/src/`, scans the attack surface, seeds `brief.md`, and writes
+   `targets/<slug>/audit/{manifest.json,surface-map.md}`).
+2. Read `targets/<slug>/audit/surface-map.md`. Skim `knowledge/wp-audit-rules.md`
+   and **`knowledge/patchstack-rules.md`** (the scope/acceptance filter — apply it).
+3. **Fan out the deep audit**: spawn one subagent per cluster (parallel, in one
+   message), **each with `model: sonnet`**, following `prompts/code-audit.md` —
+   read its files end-to-end, trace source→sink, emit JSONL leads. Agents return
+   leads + summary only (no file dumps).
+4. Aggregate returns into `targets/<slug>/audit/leads.jsonl`; dedupe; rank by
+   confidence × severity. **Apply the Patchstack gates before promoting any lead**
+   (`knowledge/patchstack-rules.md`): exploitable by unauth/Subscriber/Customer
+   (Contributor only if CVSS ≥7.5; Admin+ = out); class on the accepted list;
+   CVSS ≥6.5 (≥8.5 for low-install); reject AC:H; check novelty via `prowl lookup`
+   + the Patchstack DB. Anything failing a gate is reported as out-of-scope context, not a lead.
+5. Report back: ranked lead table (primitive, file:line, **min-role**, class,
+   confidence, cvss_est, in-scope/oos). Separate the out-of-scope ones.
+6. Frame every lead by the exploitable **primitive**, not the OWASP class.
+
+**Verdict discipline — read this twice.** Everything this route produces is a
+**candidate**, never a confirmed bug.
+- Static analysis = a candidate. A successful **local** reproduction with a
+  working PoC = still a candidate, NOT a confirmed bug. A local repro only proves
+  the code path executes in *your* lab build — it does not prove the bug is
+  exploitable on the real/production target, in scope, unpatched, or novel.
+- So: run the PoC, capture the exact request/response as **evidence**, and report
+  it factually ("I ran X locally and observed Y"). Do **not** write "this is a
+  vulnerability / confirmed bug / exploitable". Label it `candidate` and state
+  what still has to be checked (live target, config, version, prior disclosure).
+- Only the operator promotes a candidate to a bug. Finding files created via
+  `prowl finding <slug> <lead-slug>` stay `status: candidate` until the operator
+  says otherwise — never auto-set `confirmed`.
+
+If the launcher's priming message arrives first (`wphunt: …`), acknowledge audit
+mode in one line and wait for the operator to paste the plugin.
+
+### `wphunt --auto` — autonomous target selection (no operator input needed)
+Triggered by `wphunt --auto` or `wpbug --auto`. Do NOT wait for the operator to
+paste a plugin. Pick one yourself and start immediately.
+
+**Selection algorithm (run every time — pick the best target that passes all gates):**
+
+1. **Build a candidate list.** Use the WP.org API to find plugins with:
+   - `active_installs` ≥ 10,000 (sweet spot: 10k–500k; high enough to matter, low enough to be under-audited)
+   - `last_updated` within the last 12 months
+   - Tag overlap with historically buggy categories: `booking`, `form`, `payment`, `upload`, `import`, `export`, `membership`, `crm`, `woocommerce`, `ajax`, `api`, `rest`
+   - NOT in the already-audited dead-ends list (`knowledge/wp-audit-rules.md` or `targets/` dir)
+
+   Useful WP.org API endpoints:
+   ```bash
+   # Browse by tag (e.g. "booking")
+   curl -s "https://api.wordpress.org/plugins/info/1.2/?action=query_plugins&request[tag]=booking&request[per_page]=20&request[orderby]=active_installs&request[fields][active_installs]=1&request[fields][last_updated]=1"
+
+   # Or browse by search term
+   curl -s "https://api.wordpress.org/plugins/info/1.2/?action=query_plugins&request[search]=ajax+upload&request[per_page]=20&request[fields][active_installs]=1&request[fields][last_updated]=1"
+   ```
+
+2. **Gate 5 check each candidate** (same 30-second check as above). Skip any that are
+   closed, abandoned (> 12 months no update), or already in `targets/`.
+
+3. **Novelty pre-screen.** For the top 3 candidates, run:
+   ```bash
+   prowl lookup "<slug> sql injection" -t cve -n 3
+   prowl lookup "<slug> sqli" -n 3
+   ```
+   Prefer plugins with **zero recent CVEs** (under-audited) over ones with a history
+   of patches (likely already hardened or thoroughly picked over).
+
+4. **Pick the winner.** Highest score on: `active_installs` weight × tag-risk weight ×
+   novelty score (no recent CVEs = +1). Announce your choice in one line:
+   `→ auto-selected: <slug> v<version> (<installs> installs, last updated <date>)`
+   then proceed immediately to Step 0 → Step 1 without waiting.
+
+5. **If all candidates fail** (all closed / all stale / all over-audited): try a
+   different tag from the list above and repeat once. If still no good target, tell
+   the operator: "No suitable target found for tags X,Y,Z — paste a specific plugin."
+
+### `review <host> <slug>` — pre-submission report hardening
+Triggered when the operator says `review <host> <slug>` (or pastes a finding path).
+
+**This mode runs WITHOUT operator input.** Read the finding, attack it like a
+triager, fix every weakness, rewrite the submission draft, and output `READY` or
+`KILLED`. Do not ask questions mid-run.
+
+Steps: follow `prompts/report-review.md` exactly.
+- Read finding + brief.
+- Run the full triager attack list for the detected bug class.
+- For every "Live" attack: run the missing test, capture the output, fix the section.
+- Re-score CVSS independently.
+- Rewrite any "an attacker could" language to "I executed / I observed".
+- Add "Triager FAQ" block covering the top 3 likely pushbacks.
+- Update the finding file with new evidence + review-pass block.
+- Output the final H1 draft + `READY` or `KILLED`.
+
+Do not output `READY` until every attack in the checklist is explicitly dismissed.
+
 ### Explicit overrides (still work)
 - `solve this lab: <title>\n<url>` — same as 1, but title is given.
 - `new target: <host> — recon-intake` — force intake mode.
 - `hunt <host>` — continue an existing target. Run `prowl hunt <host>` for the bundle, then follow `prompts/hunt-loop.md`. Report back in the fixed shape: Goal / Tested / Findings / Open questions / Next step.
+- `audit <zip|dir|url>` / `wphunt <input>` / `wpbug <input>` — force WP plugin audit mode above.
+- `wphunt --auto` / `wpbug --auto` — autonomous target selection, no input needed.
 
 ## Corpus lookup — use BEFORE forming a hypothesis
 The workspace ships with the redscan corpus (CVEs, public writeups, methodology, CWEs).
@@ -163,6 +290,22 @@ When the operator says **`burp brief <host>`**:
   for manual follow-up.
 - Use `get_burp_collaborator_payload` for any SSRF / XXE / blind injection
   hypothesis; poll with `poll_burp_collaborator` after a short wait.
+
+## BurpStrike active scanner
+`prowl hunt <host>` auto-launches **BurpStrike** (an active DAST scanner at
+`http://127.0.0.1:7332`) and inlines a live findings section into the bundle.
+It covers reflected/DOM **XSS** (confirmed in a real headless browser), **open
+redirect**, **path traversal**, and **CORS** misconfig — fed by everything you
+browse through Burp (the burplens extension forwards proxy traffic to it).
+
+- It scopes itself to `<host>` (fail-closed: it only fires at in-scope hosts).
+- During a hunt, trigger and read it via the curls in the bundle's BurpStrike
+  section (`POST /scan`, `GET /findings`, `POST /recon`, `POST /control/stop`).
+- Its output is **CANDIDATES only** — confirm each with a real PoC + captured
+  output before writing a finding, exactly like every other lead (iron rule 3).
+- Disable for a run with `PROWL_BURPSTRIKE=0 prowl hunt <host>`.
+- Complements the Burp MCP tools above: Burp MCP = manual/raw requests +
+  collaborator; BurpStrike = automated param fuzzing + browser-confirmed XSS.
 
 ## When in doubt
 - Re-read `CHEAT.md` and the relevant `knowledge/techniques/<slug>.md`.

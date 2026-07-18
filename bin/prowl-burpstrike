@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# prowl-burpstrike — glue between prowl hunts and the BurpStrike active scanner.
+#
+#   prowl-burpstrike start            boot the BurpStrike backend if not running
+#   prowl-burpstrike scope <host>     add <host> to the scan scope (include)
+#   prowl-burpstrike bundle <host>    emit the hunt-context markdown section
+#   prowl-burpstrike status           print running state + dashboard URL
+#
+# Config (env): BURPSTRIKE_DIR (default ~/tools/burpstrike), BURPSTRIKE_PORT (7332).
+# Best-effort by design: NEVER aborts the caller (no `set -e`).
+set -uo pipefail
+
+BS_DIR="${BURPSTRIKE_DIR:-$HOME/tools/burpstrike}"
+BS_PORT="${BURPSTRIKE_PORT:-7332}"
+BASE="http://127.0.0.1:${BS_PORT}"
+LOG="${BURPSTRIKE_LOG:-/tmp/burpstrike-prowl.log}"
+
+# Default to ACTIVE auto-fire during hunts; PROWL_BURPSTRIKE_PASSIVE=1 opts out.
+if [ "${PROWL_BURPSTRIKE_PASSIVE:-0}" = "1" ]; then MODE="passive"; else MODE="active"; fi
+
+up() { curl -fsS -m 2 "$BASE/stats" >/dev/null 2>&1; }
+
+set_mode() { curl -fsS -m 3 -X POST "$BASE/control/auto?mode=${MODE}" >/dev/null 2>&1; }
+
+cmd_start() {
+  [ -d "$BS_DIR/backend" ] || { echo "burpstrike not found at $BS_DIR (set BURPSTRIKE_DIR)" >&2; return 1; }
+  up && { set_mode; return 0; }
+  local uvi="$BS_DIR/backend/venv/bin/uvicorn"
+  [ -x "$uvi" ] || uvi="$(command -v uvicorn || true)"
+  [ -n "$uvi" ] || { echo "uvicorn missing — run $BS_DIR/backend/start.sh once" >&2; return 1; }
+  ( cd "$BS_DIR/backend" && BURPSTRIKE_PORT="$BS_PORT" BURPSTRIKE_AUTO="$MODE" \
+      nohup "$uvi" main:app --host 127.0.0.1 --port "$BS_PORT" --log-level warning \
+      >>"$LOG" 2>&1 & )
+  local i
+  for i in $(seq 1 20); do up && { set_mode; return 0; }; sleep 0.5; done
+  echo "burpstrike did not come up within 10s — see $LOG" >&2
+  return 1
+}
+
+cmd_scope() {
+  local host="${1:-}"; [ -n "$host" ] || return 1
+  curl -fsS -m 3 -X POST "$BASE/scope" -H 'Content-Type: application/json' \
+    -d "{\"pattern\":\"${host}\",\"include\":true}" >/dev/null 2>&1
+}
+
+cmd_status() { if up; then echo "running at $BASE"; else echo "not running"; fi; }
+
+cmd_restart() {
+  # Stop any backend bound to this port, then start fresh (picks up config changes).
+  ps -ef | grep -E "uvicorn main:app.*--port ${BS_PORT}|main:app" | grep -v grep \
+    | awk '{print $2}' | xargs -r kill -9 2>/dev/null
+  sleep 1
+  cmd_start
+}
+
+# Show what the AI co-hunter sees: leads from captured req/resp (+ optional since ts).
+cmd_feed() {
+  up || { echo "backend not running" >&2; return 1; }
+  local since="${1:-}"
+  local url="$BASE/feed?project_id=default"; [ -n "$since" ] && url="$url&since=$since"
+  BS_BASE="$BASE" BS_FEED="$(curl -fsS "$url")" python3 - <<'PY'
+import os, json
+try:
+    d = json.loads(os.environ.get("BS_FEED", "{}"))
+except Exception:
+    d = {}
+base = os.environ.get("BS_BASE", "")
+print("# BurpStrike feed @ %s  (%s requests, %s findings)\n" % (
+    d.get("now", "?"), d.get("new_requests", 0), d.get("new_findings", 0)))
+leads = d.get("leads", [])
+if leads:
+    print("## leads (captured exchanges with analysis tags)")
+    for t in leads:
+        print("- [%s] %s %s -> %s  tags=%s" % (t["id"], t["method"], t["url"], t["status"], t["tags"]))
+        print("    full detail: curl -s '%s/history/%s'" % (base, t["id"]))
+for f in d.get("findings", []):
+    print("- [FINDING %s] %s/%s %s param=%s :: %s" % (
+        f["scanner"], f["severity"], f["confidence"], f["url"], f["param"], (f["evidence"] or "")[:80]))
+if not leads and not d.get("findings"):
+    print("(nothing yet — browse the target through Burp)")
+PY
+}
+
+# Diagnostic: prove the backend + dashboard pipeline without Burp.
+cmd_test() {
+  if ! up; then echo "FAIL: backend not running at $BASE — run: prowl-burpstrike start" >&2; return 1; fi
+  local before after
+  before=$(curl -fsS "$BASE/stats" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("traffic",0))' 2>/dev/null || echo 0)
+  curl -fsS -X POST "$BASE/traffic" -H 'Content-Type: application/json' -d '{
+    "id":"selftest","timestamp":"t","project_id":"default",
+    "request":{"method":"GET","url":"http://burpstrike.selftest/probe?q=1","headers":{"Host":"burpstrike.selftest"},"body":""},
+    "response":{"status":200,"headers":{"Content-Type":"text/html"},"body":""}
+  }' >/dev/null 2>&1
+  sleep 1
+  after=$(curl -fsS "$BASE/stats" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("traffic",0))' 2>/dev/null || echo 0)
+  if [ "$after" -gt "$before" ]; then
+    echo "OK: backend ingests traffic (counter $before -> $after). Open $BASE — you should see"
+    echo "    a 'GET http://burpstrike.selftest/probe' line in the live ticker."
+    echo "If Burp shows nothing, the break is the EXTENSION side — checklist:"
+    echo "  1. Load extension/target/burpstrike.jar (its tab defaults to $BASE), OR"
+    echo "     on the BurpLens tab set Backend URL exactly to: $BASE"
+    echo "  2. The extension tab's Activity Log should print '→ GET <url>' per request"
+    echo "     (and NO 'ERR:' lines — an ERR means wrong URL or backend down)"
+    echo "  3. Clear the tab's Scope filter (empty = forward all hosts)"
+    echo "  4. In Burp: Proxy must be ON and intercepting (traffic flows through it)"
+  else
+    echo "FAIL: backend did not register the probe — check $LOG" >&2; return 1
+  fi
+}
+
+cmd_bundle() {
+  local host="${1:-}"
+  if ! up; then
+    echo "## BurpStrike active scanner"
+    echo "_status: NOT running. Start with \`prowl-burpstrike start\` or \`$BS_DIR/backend/start.sh\`._"
+    return 0
+  fi
+  cmd_scope "$host"
+  set_mode
+  local automsg
+  if [ "$MODE" = "active" ]; then
+    automsg="AUTO-FIRE is ON: payloads fire automatically on every new in-scope request as you browse — no manual /scan needed. (disable per-run with PROWL_BURPSTRIKE_PASSIVE=1)"
+  else
+    automsg="PASSIVE mode: traffic is recorded only; fire payloads with the /scan curl below."
+  fi
+  cat <<EOF
+## BurpStrike active scanner — LIVE ($BASE) — mode: ${MODE}
+
+An active **XSS / Open-Redirect / Path-Traversal / CORS** scanner is running and
+scoped to \`$host\`. It ingests everything you browse through Burp — the burplens
+extension forwards proxy traffic to \`$BASE/traffic\` — auto-extracts params + JS,
+and surfaces **CANDIDATE** bugs (XSS confirmed in a real headless browser).
+
+> ${automsg}
+
+Treat every finding as a CANDIDATE: confirm with a real PoC per the iron rules
+before writing it up. This is the same discipline as the rest of prowl.
+
+Use it during the hunt:
+\`\`\`bash
+# fire active payloads at everything browsed so far (in-scope only):
+curl -s -X POST $BASE/scan -H 'Content-Type: application/json' -d '{"project_id":"default"}'
+# read findings, newest first:
+curl -s '$BASE/findings?project_id=default' | jq -r '.[] | "[\(.scanner)] \(.severity)/\(.confidence) \(.method) \(.url) param=\(.param) :: \(.evidence)"'
+# deep recon on a wildcard apex (subdomains -> live hosts -> optional auto-scan):
+curl -s -X POST $BASE/recon -H 'Content-Type: application/json' -d '{"target":"$host","auto_scan":false}'
+# kill switch — stop all active sending immediately:
+curl -s -X POST $BASE/control/stop
+\`\`\`
+
+Dashboard: $BASE  ·  point the burplens Burp extension "Backend URL" at $BASE
+EOF
+  echo
+  local snap
+  snap=$(curl -fsS -m 4 "$BASE/findings?project_id=default&limit=40" 2>/dev/null)
+  if [ -n "$snap" ] && [ "$snap" != "[]" ]; then
+    echo "### current BurpStrike findings (candidates)"
+    echo '```'
+    BS_SNAP="$snap" python3 - <<'PY' 2>/dev/null
+import os, json
+try:
+    d = json.loads(os.environ.get("BS_SNAP", "[]"))
+except Exception:
+    d = []
+for f in d:
+    print("[%s] %s/%s %s %s param=%s :: %s" % (
+        f.get("scanner", ""), f.get("severity", ""), f.get("confidence", ""),
+        f.get("method", ""), f.get("url", ""), f.get("param", ""),
+        (f.get("evidence", "") or "")[:90]))
+PY
+    echo '```'
+  else
+    echo "_No findings yet. Browse \`$host\` through Burp, then run the /scan curl above._"
+  fi
+}
+
+main() {
+  local c="${1:-status}"; shift || true
+  case "$c" in
+    start)  cmd_start  "$@" ;;
+    scope)  cmd_scope  "${1:-}" ;;
+    bundle) cmd_bundle "${1:-}" ;;
+    status)  cmd_status ;;
+    restart) cmd_restart ;;
+    test)    cmd_test ;;
+    feed)    cmd_feed "${1:-}" ;;
+    *) echo "usage: prowl-burpstrike {start|restart|scope <host>|bundle <host>|feed [since]|status|test}" >&2; return 1 ;;
+  esac
+}
+main "$@"

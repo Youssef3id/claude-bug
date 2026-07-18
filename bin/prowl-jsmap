@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+prowl-jsmap <host> [--js-dir <path>]
+
+Runs jsluice (urls + secrets) on every JS file in targets/<host>/js/,
+deduplicates and classifies the results, and writes:
+
+  targets/<host>/jsmap.md       — human surface map (auto-inlined in prowl hunt)
+  targets/<host>/jsmap-urls.txt — flat deduplicated URL list
+
+jsluice must be on PATH (go install github.com/BishopFox/jsluice/cmd/jsluice@latest).
+"""
+import argparse, json, re, subprocess, sys, os
+from pathlib import Path
+from collections import defaultdict
+
+ROOT     = Path(__file__).resolve().parents[1]
+TARGETS  = ROOT / "targets"
+JSLUICE  = os.environ.get("JSLUICE_BIN", "jsluice")
+
+# ---------------------------------------------------------------------------
+# Feature-area keyword classifier
+# ---------------------------------------------------------------------------
+AREAS = {
+    "auth":    ["auth", "login", "logout", "password", "reset", "token", "oauth",
+                "sso", "session", "mfa", "verify", "2fa", "totp", "refresh", "revoke"],
+    "admin":   ["admin", "impersonate", "promote", "staff", "internal", "superuser",
+                "manage", "sudo", "backdoor", "debug"],
+    "user":    ["user", "account", "profile", "me", "self", "settings", "preferences",
+                "avatar", "email", "phone"],
+    "org":     ["org", "team", "workspace", "tenant", "company", "enterprise",
+                "group", "department", "business"],
+    "invite":  ["invite", "member", "role", "permission", "access", "assign",
+                "grant", "revoke", "privilege"],
+    "payment": ["pay", "charge", "refund", "coupon", "discount", "price",
+                "billing", "subscription", "plan", "checkout", "cart", "order",
+                "invoice", "purchase", "transaction", "credit", "wallet"],
+    "files":   ["file", "upload", "download", "attachment", "export", "import",
+                "media", "asset", "document", "pdf", "zip", "archive"],
+    "api":     ["graphql", "webhook", "rest", "rpc", "v1", "v2", "v3"],
+    "state":   ["cancel", "approve", "reject", "confirm", "complete",
+                "transition", "status", "activate", "deactivate", "suspend",
+                "close", "reopen", "archive", "restore"],
+}
+
+# Logic-vuln flags: (label, regex-on-url, hint-for-hunter)
+LOGIC_FLAGS = [
+    ("IDOR",    re.compile(r"/(EXPR|:id|:\w+Id|\w+Id/|/by-id/)", re.I),
+                "ID in path — replay with victim session, swap IDs"),
+    ("BFLA",    re.compile(r"/(admin|impersonat|promot|staff|internal|sudo|debug)/", re.I),
+                "Admin/elevated action — call with Subscriber/Member session"),
+    ("PRIVESC", re.compile(r"/(role|permission|assign|grant|privilege|access)/", re.I),
+                "Role/permission mutation — test with lower-priv account"),
+    ("PAYMENT", re.compile(r"/(pay|charg|refund|coupon|discount|pric|billing|checkout|cart|invoice|credit|wallet)/", re.I),
+                "Payment flow — try negative amount, zero, currency swap, step-skip"),
+    ("STATE",   re.compile(r"/(cancel|approv|reject|confirm|complet|transit|activat|suspend|close|reopen)/", re.I),
+                "State machine — test illegal transitions (skip steps, jump to end-state)"),
+    ("EXPORT",  re.compile(r"/(export|import|bulk|report|download|archive)/", re.I),
+                "Bulk/export — test cross-tenant data, IDOR in filters"),
+    ("INVITE",  re.compile(r"/(invite|member|team|workspace|tenant)/", re.I),
+                "Invite/membership — test forced org join, self-invite with elevated role"),
+    ("AUTH",    re.compile(r"/(password|reset|token|oauth|sso|session|mfa|verify|2fa|refresh|revoke)/", re.I),
+                "Auth sensitive — test bypass, token replay, MFA skip, rate-limit"),
+]
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def run_jsluice(mode, js_file):
+    """Run 'jsluice urls|secrets <file>' and return parsed JSON lines."""
+    try:
+        r = subprocess.run(
+            [JSLUICE, mode, str(js_file)],
+            capture_output=True, text=True, timeout=30,
+        )
+        out = []
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return out
+    except FileNotFoundError:
+        print(f"ERROR: jsluice not found. Install: go install github.com/BishopFox/jsluice/cmd/jsluice@latest", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        return []
+
+def normalize_url(url):
+    """Replace dynamic segments (EXPR, UUIDs, numbers) with :param."""
+    url = re.sub(r"/EXPR", "/:param", url)
+    url = re.sub(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "/:uuid", url, flags=re.I)
+    url = re.sub(r"/\d{4,}", "/:id", url)
+    url = re.sub(r"\?.*$", "", url)   # strip query string for dedup key
+    return url
+
+def classify_area(url):
+    url_l = url.lower()
+    for area, kws in AREAS.items():
+        if any(k in url_l for k in kws):
+            return area
+    return "other"
+
+def logic_flags(url):
+    flags = []
+    for label, rx, hint in LOGIC_FLAGS:
+        if rx.search(url):
+            flags.append((label, hint))
+    return flags
+
+def is_external(url):
+    return url.startswith("http") and not any(
+        c in url for c in ["localhost", "127.0.0.1", "internal"]
+    )
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("host")
+    ap.add_argument("--js-dir", default=None,
+                    help="Override default targets/<host>/js/")
+    args = ap.parse_args()
+
+    host   = args.host
+    js_dir = Path(args.js_dir) if args.js_dir else TARGETS / host / "js"
+    out_dir = TARGETS / host
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not js_dir.exists():
+        print(f"No JS directory at {js_dir}", file=sys.stderr)
+        print(f"Save downloaded JS files there and re-run, or use --js-dir <path>.", file=sys.stderr)
+        sys.exit(1)
+
+    js_files = sorted(js_dir.rglob("*.js"))
+    if not js_files:
+        print(f"No .js files found in {js_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"→ jsmap: analyzing {len(js_files)} JS file(s) for {host} …", file=sys.stderr)
+
+    # Collect all URL records; key = normalized url → best record
+    url_map    = {}   # norm_url → {url, method, params, type, files: set}
+    secrets    = []   # list of secret records
+    external   = set()
+
+    for jsf in js_files:
+        fname = jsf.name
+
+        for rec in run_jsluice("urls", jsf):
+            url = rec.get("url", "")
+            if not url or len(url) < 3:
+                continue
+            if is_external(url):
+                external.add(url)
+                continue
+            norm = normalize_url(url)
+            if norm not in url_map:
+                url_map[norm] = {
+                    "url": url, "norm": norm,
+                    "method": rec.get("method", ""),
+                    "qparams": rec.get("queryParams", []),
+                    "bparams": rec.get("bodyParams", []),
+                    "type": rec.get("type", ""),
+                    "files": set(),
+                }
+            url_map[norm]["files"].add(fname)
+            # Prefer a record that has method info
+            if rec.get("method") and not url_map[norm]["method"]:
+                url_map[norm]["method"] = rec["method"]
+
+        for rec in run_jsluice("secrets", jsf):
+            secrets.append({**rec, "file": fname})
+
+    # Remove obvious noise (very short paths, pure static assets)
+    SKIP_RE = re.compile(r"\.(css|png|jpg|jpeg|gif|svg|ico|woff|ttf|eot|map|txt)$", re.I)
+    url_map = {k: v for k, v in url_map.items() if not SKIP_RE.search(k)}
+
+    # Group by area and collect logic flags
+    by_area    = defaultdict(list)
+    flagged    = defaultdict(list)   # label → list of entries
+
+    for norm, entry in sorted(url_map.items()):
+        area  = classify_area(norm)
+        flags = logic_flags(norm)
+        entry["flags"] = flags
+        by_area[area].append(entry)
+        for label, hint in flags:
+            flagged[label].append((entry, hint))
+
+    # -----------------------------------------------------------------------
+    # Write jsmap-urls.txt
+    # -----------------------------------------------------------------------
+    urls_txt = out_dir / "jsmap-urls.txt"
+    with urls_txt.open("w") as f:
+        for norm in sorted(url_map.keys()):
+            e = url_map[norm]
+            method = e["method"] or "?"
+            f.write(f"{method}\t{norm}\n")
+    print(f"  wrote: {urls_txt}", file=sys.stderr)
+
+    # -----------------------------------------------------------------------
+    # Write jsmap.md
+    # -----------------------------------------------------------------------
+    jsmap_md = out_dir / "jsmap.md"
+    lines = []
+    w = lines.append
+
+    w(f"# JS Surface Map — {host}")
+    w(f"js files analyzed : {len(js_files)}")
+    w(f"unique endpoints   : {len(url_map)}")
+    w(f"secrets found      : {len(secrets)}")
+    w(f"external refs      : {len(external)}")
+    w("")
+
+    # Secrets block
+    if secrets:
+        w("## SECRETS (rotate immediately)")
+        for s in secrets:
+            kind = s.get("kind", "unknown")
+            data = s.get("data", {})
+            sev  = s.get("severity", "?")
+            file = s.get("file", "?")
+            w(f"- [{sev.upper()}] **{kind}** in `{file}` — {json.dumps(data)}")
+        w("")
+
+    # Logic-vuln priority block
+    priority_labels = ["BFLA", "IDOR", "PRIVESC", "PAYMENT", "STATE", "INVITE", "EXPORT", "AUTH"]
+    has_flags = any(label in flagged for label in priority_labels)
+
+    if has_flags:
+        w("## LOGIC-VULN CANDIDATES (hunt these first)")
+        for label in priority_labels:
+            if label not in flagged:
+                continue
+            entries_hints = flagged[label]
+            w(f"\n### {label} ({len(entries_hints)})")
+            for entry, hint in sorted(entries_hints, key=lambda x: x[0]["norm"]):
+                method = entry["method"] or "?"
+                files  = ", ".join(sorted(entry["files"]))
+                qp     = ", ".join(entry["qparams"]) if entry["qparams"] else ""
+                w(f"- `{method} {entry['norm']}`  ← `{files}`")
+                w(f"  > {hint}")
+                if qp:
+                    w(f"  params: `{qp}`")
+        w("")
+
+    # Full endpoint map by area
+    w("## ENDPOINT MAP (by feature area)")
+    area_order = ["admin", "auth", "user", "org", "invite", "payment",
+                  "files", "state", "api", "other"]
+    for area in area_order:
+        entries = by_area.get(area)
+        if not entries:
+            continue
+        w(f"\n### {area} ({len(entries)})")
+        for e in sorted(entries, key=lambda x: x["norm"]):
+            method = e["method"] or "?"
+            files  = ", ".join(sorted(e["files"]))
+            tags   = " ".join(f"[{lbl}]" for lbl, _ in e["flags"]) if e["flags"] else ""
+            w(f"- `{method} {e['norm']}`  {tags}  ← `{files}`")
+
+    # External references
+    if external:
+        w(f"\n## EXTERNAL REFERENCES ({len(external)})")
+        for u in sorted(external):
+            w(f"- {u}")
+
+    w("")
+    w("---")
+    w(f"_generated by prowl-jsmap — edit `targets/{host}/js/` to re-run_")
+
+    jsmap_md.write_text("\n".join(lines) + "\n")
+    print(f"  wrote: {jsmap_md}", file=sys.stderr)
+
+    # Summary to stdout for prowl hunt bundle inline
+    flag_counts = {lbl: len(v) for lbl, v in flagged.items() if v}
+    summary = {
+        "host": host,
+        "js_files": len(js_files),
+        "endpoints": len(url_map),
+        "secrets": len(secrets),
+        "flags": flag_counts,
+    }
+    print(json.dumps(summary))
+
+if __name__ == "__main__":
+    main()

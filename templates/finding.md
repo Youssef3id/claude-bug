@@ -5,6 +5,16 @@ severity: [TODO critical | high | medium | low]
 status: [TODO confirmed | submitted | accepted | rejected | duplicate]
 cvss: [TODO 0.0–10.0]
 
+## pre-submission gate (must be filled — finding is NOT ready until all pass)
+> Delete this section only after the operator approves submission.
+
+- [ ] **Harm sentence:** "A victim loses / gains / has exposed: ___" (fill in something real — money, credentials, account control, non-public PII)
+- [ ] **Data class:** email / phone / address / password / session token / payment / booking financials / chaining ID → NOT favorites / VIP status / display name / preferences
+- [ ] **Exploit executed:** ran against my own account(s), output captured below — not a thought experiment
+- [ ] **Auth model compatible:** confirmed the auth mechanism carries credentials in the attack scenario (SameSite=None cookie / direct API key / etc.)
+- [ ] **Program OOS list checked:** re-read `brief.md` OOS section — this class is not listed as ineligible
+- [ ] **Triager test passed:** asked "would I triage this as valid if someone else submitted it?" → YES
+
 ## summary
 [TODO 2–3 sentences. The bug class, the asset, the concrete consequence I have proven.]
 

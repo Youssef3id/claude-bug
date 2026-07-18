@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# gohunt — one word to open the whole rig: the TOOL (BurpStrike) + the DASHBOARD
+# + BURP + the autonomous AI co-hunt.
+#
+#   gohunt                 open everything, then ask for a target
+#   gohunt <host>          open everything and start co-hunting <host>
+#   gohunt --no-burp <h>   skip launching Burp (already running)
+#
+# Env overrides: BURP_BIN, BURPSTRIKE_PORT, PROWL_ROOT.
+set -uo pipefail
+
+ROOT="${PROWL_ROOT:-$HOME/bughunt}"
+BIN="$ROOT/bin"
+BS_PORT="${BURPSTRIKE_PORT:-7332}"
+DASH="http://127.0.0.1:${BS_PORT}"
+BURP_BIN="${BURP_BIN:-$HOME/BurpSuiteCommunity/BurpSuite}"
+LAUNCH_BURP=1
+
+# parse args
+HOST=""
+for a in "$@"; do
+  case "$a" in
+    --no-burp) LAUNCH_BURP=0 ;;
+    -*)        echo "gohunt: unknown flag $a" >&2 ;;
+    *)         HOST="$a" ;;
+  esac
+done
+
+say() { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
+
+# 1) The tool — BurpStrike backend (active + capture/analysis).
+say "starting BurpStrike (the tool) on ${DASH}"
+"$BIN/prowl-burpstrike" start >/dev/null 2>&1 \
+  && say "tool up: $DASH" \
+  || echo "  ! tool failed to start — check /tmp/burpstrike-prowl.log" >&2
+
+# 2) Dashboard in the browser (best effort).
+if command -v xdg-open >/dev/null 2>&1; then
+  say "opening dashboard"
+  xdg-open "$DASH" >/dev/null 2>&1 &
+fi
+
+# 3) Burp Suite (background; relies on your saved extensions: burpstrike.jar + MCP).
+if [ "$LAUNCH_BURP" = "1" ]; then
+  if pgrep -f "burpsuite.jar|BurpSuite" >/dev/null 2>&1; then
+    say "Burp already running"
+  elif [ -x "$BURP_BIN" ]; then
+    say "launching Burp Suite"
+    nohup "$BURP_BIN" >/tmp/burp.log 2>&1 &
+    disown 2>/dev/null || true
+  else
+    echo "  ! Burp not found at $BURP_BIN (set BURP_BIN=...) — start it yourself" >&2
+  fi
+fi
+
+# 4) The AI co-hunt.
+if [ -z "$HOST" ]; then
+  echo
+  read -rp "target host (blank = open a general AI session): " HOST
+fi
+
+echo
+if [ -n "$HOST" ]; then
+  say "co-hunting ${HOST} — handing over to the AI"
+  exec "$BIN/prowl" cohunt "$HOST"
+else
+  say "opening a general AI session in $ROOT"
+  exec "$BIN/prowl" chat
+fi
